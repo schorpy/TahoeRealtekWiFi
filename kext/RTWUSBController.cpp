@@ -1268,7 +1268,13 @@ void RTWUSBController::receive(const uint8_t*bytes,size_t length) {
             if(!memcmp(p.mpdu+16,awdlBSSID,6)){
                 rtw88_rx_phy_sample sample{};int8_t rssi=0;
                 if(rtw88_rx_parse_phy(&r88RX_,&p,&sample))rssi=(int8_t)sample.signal_dbm;
-                radioAwdlHook_(radioAwdlHookCtx_,p.mpdu,p.mpdu_length,rssi,r88Channel_);
+                /* The channel the frame was heard on: during an AWDL slot the PHY
+                 * sits on radioOffchChannel_ while r88Channel_ stays on the BSS.
+                 * Reporting the BSS made IO80211 see every peer "on 2.4GHz
+                 * only ... outside bubble" (isPeerRoutable: Not Routable), so
+                 * AirDrop never routed to it (efi-awdl 2026-11-25). */
+                const uint8_t rxChannel=radioOffchState_&&radioOffchChannel_?radioOffchChannel_:r88Channel_;
+                radioAwdlHook_(radioAwdlHookCtx_,p.mpdu,p.mpdu_length,rssi,rxChannel);
                 continue;
             }
         }
@@ -2532,18 +2538,84 @@ void RTWUSBController::radioABIEntry(RadioABICall *call) {
         call->result = radioAwdlTxStat(static_cast<struct rtl_radio_awdl_txstat *>(p1));
         return;
     }
-    if (strcmp(fn, RTL_RADIO_FN_AWDL_PORT) == 0 ||
-        strcmp(fn, RTL_RADIO_FN_AWDL_RATE) == 0 ||
+    if (strcmp(fn, RTL_RADIO_FN_AWDL_PORT) == 0) {
+        call->result = radioAwdlPort(static_cast<const uint8_t *>(p1));
+        return;
+    }
+    if (strcmp(fn, RTL_RADIO_FN_AWDL_RATE) == 0 ||
         strcmp(fn, RTL_RADIO_FN_AWDL_TXSTAT) == 0 ||
         strcmp(fn, RTL_RADIO_FN_SET_CHANNEL) == 0 ||
         strcmp(fn, RTL_RADIO_FN_AWDL_OFFCH) == 0 ||
         strcmp(fn, RTL_RADIO_FN_AWDL_AGG) == 0) {
-        /* Milestone 4: AwdlPort needs a second MACID/ad-hoc port in the
-         * rtw88 station firmware API; AwdlAgg needs host-driven BA agreements.
-         * Without the port, unicast AWDL TX still works but without HW ACKs. */
+        /* AwdlAgg needs host-driven BA agreements; the layer then sends
+         * single frames. */
         call->result = kIOReturnUnsupported;
         return;
     }
+}
+
+/* ---- AWDL port 1 ----
+ * Same registers as RTL8814Native's rtl8814native_radio_awdl_port on this
+ * 8821C (AWDLTx.c): awdl0's MAC in REG_MACID1 (0x700), the AWDL BSSID in
+ * REG_BSSID1 (0x708) and port 1 ad-hoc in MSR (0x102) bits 3:2, so the MAC
+ * ACKs unicast frames addressed to awdl0; RCR (0x608) CBSSID_DATA (bit 6)
+ * clear so data of other BSSIDs reaches the AWDL tap. The station code
+ * only touches port 0's type bits but sets CBSSID_DATA on RUN, so
+ * station88Hardware re-clears it while the port is on. Register state is
+ * lost with the backend; start88 re-applies it. */
+IOReturn RTWUSBController::radioAwdlPort(const uint8_t *mac) {
+    if (!is88Family()) return kIOReturnUnsupported;
+    if (mac) {
+        memcpy(radioAwdlPortMac_, mac, 6);
+        radioAwdlPort_ = true;
+    } else {
+        radioAwdlPort_ = false;
+    }
+    /* A torn-down backend takes it at the next start88. */
+    if (!attached_ || !present_ || sleeping_ || usbError_ != kIOReturnSuccess ||
+        core_.core_error || !running_ || !r88Station_.initialized)
+        return kIOReturnSuccess;
+    const int error = apply88AwdlPort(radioAwdlPort_);
+    return error ? fromErrno(error) : kIOReturnSuccess;
+}
+
+int RTWUSBController::apply88AwdlPort(bool on) {
+    static const uint8_t awdlBSSID[6] = {0x00, 0x25, 0x00, 0xff, 0x94, 0x73};
+    int e = 0;
+    if (on) {
+        for (unsigned i = 0; i < 6 && !e; ++i)
+            e = r88Write(this, (uint16_t)(0x700 + i), 1, radioAwdlPortMac_[i]);
+        for (unsigned i = 0; i < 6 && !e; ++i)
+            e = r88Write(this, (uint16_t)(0x708 + i), 1, awdlBSSID[i]);
+        if (e) return e;
+    }
+    uint32_t msr = 0;
+    if ((e = r88Read(this, 0x102, 1, &msr))) return e;
+    msr = (msr & ~0x0cu) | (on ? (0x01u << 2) : 0u);   /* 1 = ad-hoc, 0 = no link */
+    if ((e = r88Write(this, 0x102, 1, msr))) return e;
+    return awdl88Rcr();
+}
+
+int RTWUSBController::awdl88Rcr() {
+    uint32_t rcr = 0;
+    int e = r88Read(this, 0x608, 4, &rcr);
+    if (e) return e;
+    uint32_t want = rcr;
+    /* RCR_AAP (bit 0) too, as on the RTL8814AU where AirDrop works (live RCR
+     * 0xF40060CE, RTL8814Native Docs/AWDL_RTL8814_RX_ACK.md 2.1/2.4): AAP
+     * passes all unicast to the host; port 1 only decides the hardware ACK.
+     * Without it the 8821C dropped every unicast to awdl0 (efi-awdl
+     * 2026-11-25, 5 GHz BSS: AF rx 1280, data rx 5, ping6 over awdl0 0/10).
+     * Software drops non-AWDL unicast for other stations. */
+    if (radioAwdlPort_) {
+        want &= ~0x40u;
+        want |= 0x01u;
+    } else {
+        want &= ~0x01u;                 /* station mode never sets AAP */
+        if (r88Station_.state == RTW88_STATION_RUN)
+            want |= 0x40u;              /* what rtw88_station_configure(RUN) sets */
+    }
+    return want == rcr ? 0 : r88Write(this, 0x608, 4, want);
 }
 
 void RTWUSBController::radioStatus(struct rtl_radio_status *out) {
@@ -2748,7 +2820,49 @@ void RTWUSBController::radioLinkRefresh() {
         setLinkStatus(kIONetworkLinkValid);
 }
 
+/* Diagnostics for AWDL TX (efi-awdl 2026-11-25: every PSF/MIF refused and
+ * the layer's own error log had rotated out). Snapshot of the radio state at
+ * the last refusal, published as RTWAwdlTxDiag. */
 IOReturn RTWUSBController::radioTx80211(const uint8_t *frame, uint32_t *len) {
+    const IOReturn r = radioTx80211Inner(frame, len);
+    auto &d = radioTxDiag_;
+    ++d.calls;
+    if (r == kIOReturnSuccess) {
+        ++d.ok;
+    } else {
+        ++d.fail;
+        d.lastErr = (uint32_t)r;
+        d.lastFailBits = (core_.core_error ? 1u : 0) | (!running_ ? 2u : 0) | (stopping_ ? 4u : 0) |
+            (!present_ ? 8u : 0) | (sleeping_ ? 16u : 0) | (usbError_ != kIOReturnSuccess ? 32u : 0) |
+            (r88Core_.firmware.last_error ? 64u : 0) | (!r88Station_.initialized ? 128u : 0) |
+            (radioOffchState_ ? 256u : 0);
+        d.lastSlotCh = radioOffchChannel_;
+        const auto phy = rtw88_phy_radio_get_status(&r88PHY_);
+        d.lastPhyCh = phy.primary_channel;
+        d.lastPhyReady = (phy.error ? 4u : 0) | (phy.channel_ready ? 1u : 0) |
+            (rtw88_phy_radio_ready(&r88PHY_) ? 2u : 0);
+        d.lastBssCh = r88Channel_;
+        d.lastRadioState = r88RadioState(this, r88Channel_);
+        d.lastPending = ledger_.pending;
+        d.lastLen = len ? *len : 0;
+    }
+    publishAwdlTxDiag(false);
+    return r;
+}
+
+void RTWUSBController::publishAwdlTxDiag(bool force) {
+    auto &d = radioTxDiag_;
+    if (!force && d.calls > 8 && (d.calls & 31) != 0) return;
+    char text[256];
+    snprintf(text, sizeof(text),
+             "calls %llu ok %llu fail %llu | last err 0x%x bits 0x%x slotCh %u phyCh %u phyReady %u "
+             "bssCh %u radioState %u pending 0x%x len %u",
+             d.calls, d.ok, d.fail, d.lastErr, d.lastFailBits, d.lastSlotCh, d.lastPhyCh,
+             d.lastPhyReady, d.lastBssCh, d.lastRadioState, d.lastPending, d.lastLen);
+    setProperty("RTWAwdlTxDiag", text);
+}
+
+IOReturn RTWUSBController::radioTx80211Inner(const uint8_t *frame, uint32_t *len) {
     /* ABI: one management frame, or one AWDL data frame (data or QoS data,
      * To/From DS 0, A3 = the AWDL BSSID), header and body, no FCS, on the
      * current operating channel. The radio supplies the sequence number. */
@@ -2771,7 +2885,21 @@ IOReturn RTWUSBController::radioTx80211(const uint8_t *frame, uint32_t *len) {
         usbError_ != kIOReturnSuccess || r88Core_.firmware.last_error ||
         !r88Station_.initialized)
         return kIOReturnNotReady;
-    if (r88RadioState(this, r88Channel_) != 2) return kIOReturnBusy;
+    /* Gate like DrogaBox's rtl8814native_radio_tx_80211 (RTL8814Native
+     * AWDLTx.c), where AirDrop works: no channel/readiness match at all; the
+     * frame goes out on whatever channel the PHY is tuned to (the AWDL
+     * channel during a slot, the BSS otherwise). It refuses only when TX is
+     * impossible or an unassociated scan is away from the parked channel.
+     * The fork's stricter r88RadioState/PHY-match gate refused EVERY PSF/MIF
+     * (efi-awdl 2026-11-25: psf 0 mif 0 fail 268, mcc 219 ok). Infra data
+     * stays held during a slot by the existing software hold (radioAwdlOffch);
+     * these frames use the management queue directly. */
+    if (core_.sc_ic.ic_state == IEEE80211_S_SCAN && !radioOffchState_)
+        return kIOReturnBusy;
+    const auto phy = rtw88_phy_radio_get_status(&r88PHY_);
+    const uint8_t txChannel = !phy.error && phy.primary_channel ? (uint8_t)phy.primary_channel
+                                                                : r88Channel_;
+    if (!txChannel) return kIOReturnBusy;
 
     unsigned index = RTW_TRANSFER_SLOTS;
     IOInterruptState lock = IOSimpleLockLockDisableInterrupt(completionLock_);
@@ -2798,7 +2926,7 @@ IOReturn RTWUSBController::radioTx80211(const uint8_t *frame, uint32_t *len) {
     options.sequence = (uint16_t)(sequence >> 4);
     options.queue = data ? (qos ? (frame[24] & 15U) : 0) : 18;
     options.multicast = multicast;
-    options.band_5ghz = r88Channel_ > 14;
+    options.band_5ghz = txChannel > 14;
     /* Fixed rates: OFDM 6 Mb/s (mgmt) and 12 Mb/s (AWDL data) = indices 4/6
      * of the Linux-rtw88 rate table (0-3 CCK, 4-11 OFDM). */
     options.rate = data ? (radioAwdlRate_ ? radioAwdlRate_ : 6) : 4;
@@ -2915,7 +3043,14 @@ IOReturn RTWUSBController::radioAwdlOffch(const uint32_t *channel) {
      * driver is a later step), or back to the BSS with channel 0. Leaving
      * sends a null frame with PM set and holds the data queues; returning
      * sends PM clear and resumes them. Bookkeeping stays on the BSS so
-     * rtlRadioStatus keeps reporting it. */
+     * rtlRadioStatus keeps reporting it.
+     *
+     * A failed switch is recovered, not latched (efi-awdl 2026-11-25, BSS on
+     * ch 1 + AWDL on 149: 4 s after syncing to an iPhone one switch failed,
+     * core_error latched and every later SCAN/JOIN was NotReady until reboot).
+     * On failure the radio goes back to the saved BSS operating state with a
+     * calibrated set; only if that also fails is core_error latched. Plain
+     * returns skip the calibration, like RTL8814Native's awdl_keep_txpwr. */
     if (!channel) return kIOReturnBadArgument;
     const uint32_t requested = *channel;
     const uint8_t ch = (uint8_t)requested;
@@ -2944,29 +3079,42 @@ IOReturn RTWUSBController::radioAwdlOffch(const uint32_t *channel) {
     }
 
     const uint8_t home = r88Channel_;
+    /* Back to the saved BSS state. calibrate: only when recovering. Returns
+     * 0, or the errno that was latched. */
+    auto restoreBSS = [&](bool calibrate, uint8_t from) -> int {
+        int e = 0;
+        if (r88Coex_ && (radioOffchSaved_.primary > 14) != (from > 14))
+            e = coex88Notify(RTW88_CX_SWITCH_BAND, IEEE80211_S_RUN, radioOffchSaved_.primary);
+        if (e) {                        /* coex is advisory: still retune */
+            radioOffchLastErr_ = e;
+            radioOffchLastStep_ = 3;
+            ++radioOffchDiag_.coexFail;
+        }
+        int r = set88Operating(radioOffchSaved_, calibrate);
+        if (r && !calibrate) r = set88Operating(radioOffchSaved_, true);
+        r88Operating_ = radioOffchSaved_;
+        r88Channel_ = radioOffchSaved_.primary;
+        radioOffchState_ = 0; radioOffchChannel_ = 0;
+        if (r) {
+            radioOffchLastErr_ = r;
+            radioOffchLastStep_ = 4;
+            ++radioOffchDiag_.latched;
+            core_.core_error = r;
+            publishOffchDiag(true);
+            return r;
+        }
+        radioAwdlNullFrame(0);          /* PM clear on the BSS channel */
+        rtwn_start(&ic.ic_if);          /* flush the held data queues */
+        return 0;
+    };
+
     if (!ch || ch == home) {
         if (radioOffchState_) {
-            radioOffchState_ = 0;
-            if (r88Coex_ && (radioOffchSaved_.primary > 14) != (home > 14)) {
-                const int notify = coex88Notify(RTW88_CX_SWITCH_BAND,
-                                                IEEE80211_S_RUN,
-                                                radioOffchSaved_.primary);
-                if (notify) {
-                    radioOffchLastErr_ = notify;
-                    radioOffchLastStep_ = 3;
-                    core_.core_error = notify;
-                    return fromErrno(notify);
-                }
-            }
-            const int error = set88Operating(radioOffchSaved_, true);
-            if (error) {
-                radioOffchLastErr_ = error;
-                radioOffchLastStep_ = 4;
-                core_.core_error = error;
-                return fromErrno(error);
-            }
-            radioAwdlNullFrame(0);      /* PM clear on the BSS channel */
-            rtwn_start(&ic.ic_if);      /* flush the held data queues */
+            const uint8_t from = radioOffchChannel_ ? radioOffchChannel_ : home;
+            ++radioOffchDiag_.back;
+            const int r = restoreBSS(false, from);
+            publishOffchDiag(false);
+            if (r) return fromErrno(r);
         }
         return kIOReturnSuccess;
     }
@@ -2976,38 +3124,65 @@ IOReturn RTWUSBController::radioAwdlOffch(const uint32_t *channel) {
         radioAwdlNullFrame(1);          /* PM set while still on the BSS */
         radioOffchState_ = 1;
     }
-    if (r88Coex_ && (ch > 14) != (home > 14)) {
+    const uint8_t from = radioOffchChannel_ ? radioOffchChannel_ : home;
+    ++radioOffchDiag_.out;
+    int error = 0;
+    if (r88Coex_ && (ch > 14) != (from > 14)) {
         const int notify = coex88Notify(RTW88_CX_SWITCH_BAND, IEEE80211_S_RUN, ch);
         if (notify) {
-            if (first) {
-                radioOffchState_ = 0;
-                radioAwdlNullFrame(0);
-            }
             radioOffchLastErr_ = notify;
             radioOffchLastStep_ = 1;
-            core_.core_error = notify;
-            return fromErrno(notify);
+            ++radioOffchDiag_.coexFail;
+            error = notify;
         }
     }
-    const int error = set88Operating(rtw88_station_operating{ch, ch, 20, 0}, false);
-    if (error) {
-        if (first) {
-            radioOffchState_ = 0;
-            radioAwdlNullFrame(0);
+    if (!error) {
+        error = set88Operating(rtw88_station_operating{ch, ch, 20, 0}, false);
+        if (error) {
+            radioOffchLastErr_ = error;
+            radioOffchLastStep_ = 2;
         }
-        radioOffchLastErr_ = error;
-        radioOffchLastStep_ = 2;
-        core_.core_error = error;
-        return fromErrno(error);
+    }
+    if (error) {
+        /* Refuse this slot, but keep the link: back to the BSS. */
+        ++radioOffchDiag_.outFail;
+        const int lastErr = radioOffchLastErr_, lastStep = radioOffchLastStep_;
+        const int r = restoreBSS(true, ch);
+        if (!r) {
+            radioOffchLastErr_ = lastErr;
+            radioOffchLastStep_ = (uint8_t)lastStep;
+            ++radioOffchDiag_.recovered;
+        }
+        publishOffchDiag(true);
+        return fromErrno(r ? r : error);
     }
     /* Keep the ABI-visible radio state on the BSS while the PHY sits in the
      * AWDL slot; r88RadioState(BSS) is 0 meanwhile, so the data path stays
      * down even if something calls rtwn_start directly. */
     r88Operating_ = radioOffchSaved_;
     r88Channel_ = radioOffchSaved_.primary;
+    radioOffchChannel_ = ch;            /* Tx80211 sends AWDL frames here */
     r88RX_.current_width = (uint8_t)(radioOffchSaved_.width_mhz == 80 ? 2 :
         radioOffchSaved_.width_mhz == 40 ? 1 : 0);
+    publishOffchDiag(false);
     return kIOReturnSuccess;
+}
+
+void RTWUSBController::publishOffchDiag(bool force) {
+    auto &d = radioOffchDiag_;
+    if (!force && ((d.out + d.back) & 63) != 0) return;
+    char text[200];
+    snprintf(text, sizeof(text),
+             "out %llu back %llu outFail %llu recovered %llu latched %llu coexFail %llu | "
+             "last err %d step %u",
+             d.out, d.back, d.outFail, d.recovered, d.latched, d.coexFail,
+             radioOffchLastErr_, radioOffchLastStep_);
+    setProperty("RTWAwdlOffchDiag", text);
+    /* Failures also go to the kernel log: the ioreg copy is lost with the
+     * reboot that usually follows a dead link. */
+    if (force)
+        IOLog("RTWAwdlOffch: %s r88Ch %u slotCh %u coreErr %d\n", text, r88Channel_,
+              radioOffchChannel_, core_.core_error);
 }
 
 IOReturn RTWUSBController::radioAwdlRate(const uint32_t *rate) {

@@ -126,7 +126,7 @@ int RTWUSBController::start88(){
  e=rtw88_station_initialize(&r88Station_,&r88MAC_,r88RadioState,this,station88MAC());if(e)goto fail;
  ic.ic_bss->ni_chan=ic.ic_ibss_chan;e=set88Channel((uint8_t)ieee80211_chan2ieee(&ic,ic.ic_ibss_chan),false);if(e)goto fail;
  familyRecovery_.diag.stage=rtw::StationRecovery::RX;e=busInitialize(this);if(e)goto fail;familyRecovery_.diag.stage=rtw::StationRecovery::Start;e=send88Startup();if(e)goto fail;e=coex88Start();if(e)goto fail;
- ifq_clr_oactive(&ifp.if_snd);ifp.if_flags|=IFF_RUNNING;e=ic.ic_newstate(&ic,IEEE80211_S_SCAN,-1);if(e)goto fail;radioReady_=true;finishFamilyStart();return 0;
+ ifq_clr_oactive(&ifp.if_snd);ifp.if_flags|=IFF_RUNNING;e=ic.ic_newstate(&ic,IEEE80211_S_SCAN,-1);if(e)goto fail;radioReady_=true;if(radioAwdlPort_)(void)apply88AwdlPort(true);finishFamilyStart();return 0;
 fail:failFamilyStart(e);stop88();if(!familyRecovery_.transient(e))core_.core_error=e;return e;
 }
 void RTWUSBController::remember88Authority(bool complete){
@@ -237,7 +237,9 @@ int RTWUSBController::station88Hardware(ieee80211_state state){
  if(state==IEEE80211_S_INIT)return rtw88_station_configure(&r88Station_,RTW88_STATION_INIT,nullptr);
  const auto&ic=core_.sc_ic;const auto*n=ic.ic_bss;if(!n||!n->ni_chan||n->ni_chan==IEEE80211_CHAN_ANYC)return EINVAL;
  rtw88_station_params params{};memcpy(params.mac,station88MAC(),6);memcpy(params.bssid,n->ni_bssid,6);params.channel=r88Channel_;params.short_slot=(ic.ic_flags&IEEE80211_F_SHSLOT)!=0;params.ht=state==IEEE80211_S_RUN&&(n->ni_flags&IEEE80211_NODE_HT)!=0;params.passive_scan=state==IEEE80211_S_SCAN&&(n->ni_chan->ic_flags&IEEE80211_CHAN_PASSIVE);params.aid=n->ni_associd&0x3fff;params.basic_rates=station88Rates(true);if(!params.basic_rates&&state!=IEEE80211_S_RUN)params.basic_rates=r88Channel_>14?16:1;
- return rtw88_station_configure(&r88Station_,(rtw88_station_state)state,&params);
+ int e=rtw88_station_configure(&r88Station_,(rtw88_station_state)state,&params);
+ if(!e&&radioAwdlPort_)e=awdl88Rcr();
+ return e;
 }
 int RTWUSBController::state88(ieee80211com*ic,ieee80211_state state,int arg){
  if(!ic||!core_.sc_newstate||ic->ic_opmode!=IEEE80211_M_STA||state<IEEE80211_S_INIT||state>IEEE80211_S_RUN)return EINVAL;

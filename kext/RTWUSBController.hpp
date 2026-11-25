@@ -393,12 +393,27 @@ private:
     IOReturn radioAwdlOffch(const uint32_t *);
     IOReturn radioAwdlRate(const uint32_t *);
     IOReturn radioAwdlTxStat(struct rtl_radio_awdl_txstat *);
+    IOReturn radioAwdlPort(const uint8_t *mac);
+    IOReturn radioTx80211Inner(const uint8_t *frame, uint32_t *len);
+    void publishOffchDiag(bool force);
+    struct { uint64_t out, back, outFail, recovered, latched, coexFail; } radioOffchDiag_{};
+    void publishAwdlTxDiag(bool force);
+    struct {
+        uint64_t calls, ok, fail;
+        uint32_t lastErr, lastFailBits, lastSlotCh, lastPhyCh, lastPhyReady, lastBssCh;
+        uint32_t lastRadioState, lastPending, lastLen;
+    } radioTxDiag_{};
+    int apply88AwdlPort(bool on);
+    int awdl88Rcr();
+    bool radioAwdlPort_ = false;                /* port 1 ad-hoc on the AWDL BSSID */
+    uint8_t radioAwdlPortMac_[6]{};             /* awdl0's MAC for REG_MACID1 */
     void radioAwdlNullFrame(uint8_t);
     uint16_t radioNextSeq_ = 0;
     /* AWDL off-channel state (see RTLRadioABI.h semantics) */
     uint32_t radioIdleChannel_ = 0;             /* parked channel while IDLE */
     rtw88_station_operating radioOffchSaved_{}; /* BSS operating state during a slot */
     uint8_t radioOffchState_ = 0;               /* 0 = none, 1 = AWDL slot active */
+    uint8_t radioOffchChannel_ = 0;             /* channel the PHY sits on during the slot */
     uint32_t radioAwdlRate_ = 0;                /* TX descriptor rate index, 0 = fixed 12 Mb/s */
     /* Bench diagnostics: errno + failing step of the last offch request
      * (1 coex band switch, 2 tune-to-AWDL, 3 restore coex, 4 restore tune). */
