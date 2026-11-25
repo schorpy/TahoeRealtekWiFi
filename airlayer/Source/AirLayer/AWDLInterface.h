@@ -1,0 +1,872 @@
+/*
+ * RTL8814AirLayer — AWDL stage 1: the virtual interface chain and awdl0.
+ *
+ * Source/IO80211/IO80211_25_6_0.h stops at IO80211SkywalkInterface (slot 460,
+ * 0xE60, syncDPSStats). This file continues the same object with the vtables of
+ * IO80211VirtualInterface and IO80211AWDLProtocol, declared by offset
+ * (offset = 8 * slot, the convention of IO80211_25_6_0.h):
+ *
+ *   0xE68 - 0xF38  IO80211VirtualInterface, 27 methods
+ *   0xF40          setMacAddress(ether_addr&), pure
+ *   0xF48 - 0xFC0  16 reserved slots
+ *   0xFC8 - 0x11B8 IO80211AWDLProtocol, 63 pure slots
+ *
+ * Only the AWDL slots are overridden here; the 27 methods above them keep the
+ * family implementations, which the loader resolves from the kernel collection.
+ * The class sizes (0x130) are checked at the end. This file must not be
+ * included together with Source/IO80211/IO80211AWDL_25_6_0.h: that header is a
+ * signature catalog, and a declaration that omits slots shifts every offset
+ * after it.
+ *
+ * Copyright (c) 2026 DrogaBox — GPL-2.0
+ */
+#ifndef RTL_AWDL_INTERFACE_H
+#define RTL_AWDL_INTERFACE_H
+
+#include "RTLAirLayer.hpp"
+#include "AWDLBaOrig.h"
+#include "AWDLShare.h"
+
+/* ---- apple80211 payloads used by pointer in the AWDL vtables ---- */
+/* Already declared in IO80211_25_6_0.h: channel, state, key, debug command,
+ * network packet. The rest are only needed by type. */
+struct apple80211_ssid_data;
+struct apple80211_bssid_data;
+struct apple80211_encrypt;
+struct apple80211_tx_rate;
+struct apple80211_llw_params;
+struct apple80211_awdl_sync_params;
+struct apple80211_awdl_sync_enabled;
+struct apple80211_awdl_extension_state_machine_parameter;
+struct apple80211_awdl_election_id;
+struct apple80211_awdl_election_metric;
+struct apple80211_awdl_sync_channel_sequence;
+struct apple80211_peer_cache_maximum_size;
+struct apple80211_awdl_master_channel;
+struct apple80211_awdl_sync_state;
+struct apple80211_awdl_election_rssi_thresholds;
+struct apple80211_awdl_presence_mode;
+struct apple80211_awdl_election_params;
+struct apple80211_awdl_device_capabilities;
+struct apple80211_awdl_secondary_master_channel;
+struct apple80211_awdl_af_tx_mode;
+struct apple80211_awdl_min_rate;
+struct apple80211_awdl_txcal_period;
+struct apple80211_awdl_dev_stats;
+struct apple80211_awdl_dfsp_config;
+struct apple80211_awdl_cca;
+struct apple80211_awdl_cap;
+struct apple80211_awdl_bssid;
+struct apple80211_peer_cache_control;
+struct apple80211_awdl_oob_request;
+struct apple80211_awdl_sync_frame_template;
+struct apple80211_awdl_peer_traffic_registration;
+struct apple80211_awdl_dfsp_ucsa_config;
+struct apple80211_companion_skywalk_if_create;
+struct apple80211_awdl_af_sec_payload_request;
+struct apple80211_p2p_coex_protection;
+struct apple80211_awdl_psf_dwell_params;
+struct apple80211_awdl_config_request;
+struct apple80211_rtg_peer_stats_cfg;
+struct awdl_peer_advert_add;
+struct peerSlotDataStats;
+struct packetCounters_t;
+
+/* ---- VIRTUAL_IF_CREATE (type 94), Docs/AWDL_STRUCTS.md §3.2 ---- */
+struct apple80211_virt_if_create_data {
+	uint32_t f0;             /* +0x00: written by wifip2pd, read not needed  */
+	uint8_t  mac[6];         /* +0x04: requested address                     */
+	uint8_t  pad0[2];        /* +0x0A                                        */
+	uint32_t role;           /* +0x0C: 6 = AWDL                              */
+	char     ifname[16];     /* +0x10: output, BSD name of the new interface */
+};
+static_assert(sizeof(apple80211_virt_if_create_data) == 32, "virt_if_create_data");
+
+/*
+ * Slots 0xE68-0xF38. The declarations exist so the AWDL slots land on their
+ * real offsets; the bodies live in IO80211Family and are not replaced here.
+ */
+struct IO80211VirtualInterface : public IO80211SkywalkInterface {
+	OSDeclareAbstractStructors(IO80211VirtualInterface)
+public:
+	/* Overrides of inherited slots: no new vtable entries. */
+	virtual void free() override;
+	virtual void stop(IOService *) override;
+	/* Overrides that IO80211VirtualInterface itself defines (checked against
+	 * __ZTV19IO80211AWDLProtocol): without them these cells would resolve to
+	 * the IO80211SkywalkInterface or IOService bodies. */
+	virtual IOReturn configureReport(IOReportChannelList*, unsigned int, void*, void*) override; /* 0x428 */
+	virtual IOReturn updateReport(IOReportChannelList*, unsigned int, void*, void*) override; /* 0x430 */
+	virtual bool start(IOService*) override;                                       /* 0x5C0 */
+	virtual bool terminate(IOOptionBits options = 0) override;                                 /* 0x600 */
+	virtual bool attach(IOService *) override;                                     /* 0x670 */
+	virtual void detach(IOService *) override;                                     /* 0x678 */
+	virtual IOReturn newUserClient(task*, void*, unsigned int, OSDictionary*, IOUserClient**) override; /* 0x770 */
+	virtual const char * stringFromReturn(int) override;                           /* 0x780 */
+	virtual uintptr_t prepareBSDInterface(__ifnet*, unsigned int) override;        /* 0x8E8 */
+	virtual uintptr_t processBSDCommand(__ifnet*, unsigned int, void*) override;   /* 0x910 */
+	virtual uintptr_t setInterfaceEnable(bool) override;                           /* 0x930 */
+	virtual uintptr_t getFeatureFlags() override;                                  /* 0x9B8 */
+	virtual uintptr_t bpfTap(unsigned int, unsigned int) override;                 /* 0x9E0 */
+	virtual uintptr_t setMulticastAddresses(ether_addr const*, unsigned int) override; /* 0xA88 */
+	virtual uintptr_t createPeerManager() override;                                /* 0xB08 */
+	virtual uintptr_t postMessage(unsigned int, void*, unsigned long, bool) override; /* 0xB18 */
+	virtual uintptr_t logTxPacket(IO80211NetworkPacket*, PacketSkywalkScratch*, apple80211_wme_ac, bool) override; /* 0xB38 */
+	virtual uintptr_t logTxCompletionPacket(IO80211NetworkPacket*, PacketSkywalkScratch*, unsigned char*, apple80211_wme_ac, int, unsigned int, bool, bool) override; /* 0xB40 */
+	virtual uintptr_t inputPacket(IO80211NetworkPacket*, packet_info_tag*, ether_header*, bool*, bool) override; /* 0xB50 */
+	virtual uintptr_t logSkywalkTxReqPacket(IO80211NetworkPacket*, PacketSkywalkScratch*, unsigned char*, apple80211_wme_ac, bool) override; /* 0xB60 */
+	virtual uintptr_t pendingPackets(unsigned char) override;                      /* 0xB68 */
+	virtual uintptr_t packetSpace(unsigned char) override;                         /* 0xB70 */
+	virtual uintptr_t linkState() override;                                        /* 0xB88 */
+	virtual uintptr_t setScanningState(unsigned int, bool, apple80211_scan_data*, int) override; /* 0xB90 */
+	virtual uintptr_t updateLinkParameters(apple80211_interface_availability*) override; /* 0xBB0 */
+	virtual uintptr_t updateInterfaceCoexRiskPct(unsigned long long) override;     /* 0xBB8 */
+	virtual uintptr_t setInterfaceNF(apple80211_channel, long long) override;      /* 0xBE8 */
+	virtual uintptr_t setDebugFlags(unsigned long long, unsigned int) override;    /* 0xC00 */
+	virtual uintptr_t debugFlags() override;                                       /* 0xC08 */
+	virtual uintptr_t setInterfaceChipCounters(apple80211_stat_report*, apple80211_chip_counters_tx*, apple80211_chip_error_counters_tx*, apple80211_chip_counters_rx*) override; /* 0xC10 */
+	virtual uintptr_t setInterfaceMIBdot11(apple80211_stat_report*, apple80211_ManagementInformationBasedot11_counters*) override; /* 0xC18 */
+	virtual uintptr_t setFrameStats(apple80211_stat_report*, apple80211_frame_counters*) override; /* 0xC20 */
+	virtual uintptr_t setInfraSpecificFrameStats(apple80211_stat_report*, apple80211_infra_specific_stats*) override; /* 0xC28 */
+	virtual uintptr_t getWmeTxCounters(unsigned long long*) override;              /* 0xC38 */
+	virtual uintptr_t setWoWEnabled(bool) override;                                /* 0xC48 */
+	virtual uintptr_t wowEnabled() override;                                       /* 0xC50 */
+	virtual uintptr_t printDataPath(userPrintCtx*) override;                       /* 0xC58 */
+	virtual uintptr_t findOrCreateFlowQueue(IO80211FlowQueueHash) override;        /* 0xC68 */
+	virtual uintptr_t findOrCreateFlowQueueWithCache(IO80211FlowQueueHash, bool*) override; /* 0xC70 */
+	virtual uintptr_t findExistingFlowQueue(IO80211FlowQueueHash) override;        /* 0xC78 */
+	virtual uintptr_t removePacketQueue(IO80211FlowQueueHash const*) override;     /* 0xC80 */
+	virtual uintptr_t flushPacketQueues() override;                                /* 0xC88 */
+	virtual uintptr_t cachePeer(ether_addr*, unsigned int*) override;              /* 0xC90 */
+	virtual uintptr_t shouldLog(unsigned long long) override;                      /* 0xC98 */
+	virtual uintptr_t vlogDebug(unsigned long long, char const*, va_list) override; /* 0xCA0 */
+	virtual uintptr_t vlogDebugBPF(unsigned long long, char const*, va_list) override; /* 0xCA8 */
+	virtual uintptr_t getP2PSkywalkPeerMgr() override;                             /* 0xCC0 */
+	virtual uintptr_t findPeer(ether_addr&) override;                              /* 0xCD0 */
+	virtual uintptr_t getEventPipeSize() override;                                 /* 0xDB8 */
+	virtual uintptr_t createEventPipe(IO80211APIUserClient*) override;             /* 0xDC0 */
+	/* Keeps init() and init(IOService*, ether_addr*) visible next to the
+	 * overload below. */
+	using IO80211SkywalkInterface::init;
+	virtual bool init(IO80211Controller *, ether_addr *, uint32_t, const char *); /* 0xE68 */
+	virtual uintptr_t setLinkState(IO80211LinkState, unsigned int);                /* 0xE70 */
+	virtual uintptr_t forwardPacket(IO80211NetworkPacket *);                       /* 0xE78 */
+	virtual uintptr_t handleIoctl(__ifnet *, unsigned long, void *);               /* 0xE80 */
+	virtual uintptr_t addPeerToCache(unsigned char *);                             /* 0xE88 */
+	virtual uintptr_t deletePeerFromCache(unsigned char *);                        /* 0xE90 */
+	virtual uintptr_t handleDebugCmd(apple80211_debug_command *);                  /* 0xE98 */
+	virtual uintptr_t getPeerSlotDataStats(ether_addr *, bool,
+	                                       peerSlotDataStats *);                   /* 0xEA0 */
+	virtual uintptr_t getPeerDataStats(ether_addr *, bool,
+	                                   packetCounters_t *);                        /* 0xEA8 */
+	virtual uintptr_t clearPeerDataStats(ether_addr *, bool);                      /* 0xEB0 */
+	virtual uintptr_t setAwdlCurrentChannelSequenceIndex(unsigned int);            /* 0xEB8 */
+	virtual uintptr_t isOutputFlowControlled();                                    /* 0xEC0 */
+	virtual uintptr_t setOutputFlowControlled();                                   /* 0xEC8 */
+	virtual uintptr_t clearOutputFlowControlled();                                 /* 0xED0 */
+	virtual uintptr_t flushFlowQueues(ether_addr *);                               /* 0xED8 */
+	virtual uintptr_t configureAQMOutput();                                        /* 0xEE0 */
+	virtual uintptr_t attachToBpf();                                               /* 0xEE8 */
+	virtual uintptr_t configureIfnet();                                            /* 0xEF0 */
+	virtual uintptr_t reset();                                                     /* 0xEF8 */
+	virtual uintptr_t dupAndTransmitMcastPacket(IO80211NetworkPacket *,
+	                                            unsigned char *,
+	                                            unsigned char *);                  /* 0xF00 */
+	virtual uintptr_t freeMulticastPacket(IO80211NetworkPacket *);                 /* 0xF08 */
+	virtual uintptr_t triggerAWDLMulticastTx(unsigned int, unsigned char);         /* 0xF10 */
+	virtual uintptr_t p2pMulticastTx(IO80211NetworkPacket **, unsigned int);       /* 0xF18 */
+	virtual uintptr_t p2pMulticastTx(unsigned int, bool);                          /* 0xF20 */
+	virtual uintptr_t signalMulticastPackets(unsigned int, unsigned int);          /* 0xF28 */
+	virtual uintptr_t sendPendingPacketsToStack(IO80211NetworkPacket **,
+	                                            unsigned int);                     /* 0xF30 */
+	virtual uintptr_t freePendingPackets(IO80211NetworkPacket **, unsigned int);   /* 0xF38 */
+	virtual uintptr_t setMacAddress(ether_addr &) = 0;                             /* 0xF40 pure */
+	virtual uintptr_t _RESERVEDIO80211VirtualInterface0();                         /* 0xF48 */
+	virtual uintptr_t _RESERVEDIO80211VirtualInterface1();                         /* 0xF50 */
+	virtual uintptr_t _RESERVEDIO80211VirtualInterface2();                         /* 0xF58 */
+	virtual uintptr_t _RESERVEDIO80211VirtualInterface3();                         /* 0xF60 */
+	virtual uintptr_t _RESERVEDIO80211VirtualInterface4();                         /* 0xF68 */
+	virtual uintptr_t _RESERVEDIO80211VirtualInterface5();                         /* 0xF70 */
+	virtual uintptr_t _RESERVEDIO80211VirtualInterface6();                         /* 0xF78 */
+	virtual uintptr_t _RESERVEDIO80211VirtualInterface7();                         /* 0xF80 */
+	virtual uintptr_t _RESERVEDIO80211VirtualInterface8();                         /* 0xF88 */
+	virtual uintptr_t _RESERVEDIO80211VirtualInterface9();                         /* 0xF90 */
+	virtual uintptr_t _RESERVEDIO80211VirtualInterface10();                        /* 0xF98 */
+	virtual uintptr_t _RESERVEDIO80211VirtualInterface11();                        /* 0xFA0 */
+	virtual uintptr_t _RESERVEDIO80211VirtualInterface12();                        /* 0xFA8 */
+	virtual uintptr_t _RESERVEDIO80211VirtualInterface13();                        /* 0xFB0 */
+	virtual uintptr_t _RESERVEDIO80211VirtualInterface14();                        /* 0xFB8 */
+	virtual uintptr_t _RESERVEDIO80211VirtualInterface15();                        /* 0xFC0 */
+private:
+	uint8_t _rtlAwdPad[0x8];   /* kernel collection size 0x130: 0x128 + 0x8 */
+};
+
+/* 63 AWDL slots, 0xFC8-0x11B8, in vtable order (Docs/AWDL_PURE_SLOTS.md). */
+class IO80211AWDLProtocol : public IO80211VirtualInterface {
+	OSDeclareAbstractStructors(IO80211AWDLProtocol)
+public:
+	virtual IOReturn getSSID(apple80211_ssid_data *) = 0;                            /* 0xFC8 */
+	virtual IOReturn getCHANNEL(apple80211_channel_data *) = 0;                      /* 0xFD0 */
+	virtual IOReturn getBSSID(apple80211_bssid_data *) = 0;                          /* 0xFD8 */
+	virtual IOReturn getSTATE(apple80211_state_data *) = 0;                          /* 0xFE0 */
+	virtual IOReturn getAWDL_SYNC_PARAMS(apple80211_awdl_sync_params *) = 0;         /* 0xFE8 */
+	virtual IOReturn getAWDL_SYNC_ENABLED(apple80211_awdl_sync_enabled *) = 0;       /* 0xFF0 */
+	virtual IOReturn getAWDL_EXTENSION_STATE_MACHINE_PARAMETERS(
+	    apple80211_awdl_extension_state_machine_parameter *) = 0;                    /* 0xFF8 */
+	virtual IOReturn getAWDL_ELECTION_ID(apple80211_awdl_election_id *) = 0;         /* 0x1000 */
+	virtual IOReturn getAWDL_ELECTION_METRIC(apple80211_awdl_election_metric *) = 0; /* 0x1008 */
+	virtual IOReturn getAWDL_SYNCHRONIZATION_CHANNEL_SEQUENCE(
+	    apple80211_awdl_sync_channel_sequence *) = 0;                                /* 0x1010 */
+	virtual IOReturn getPEER_CACHE_MAXIMUM_SIZE(
+	    apple80211_peer_cache_maximum_size *) = 0;                                   /* 0x1018 */
+	virtual IOReturn getAWDL_MASTER_CHANNEL(apple80211_awdl_master_channel *) = 0;   /* 0x1020 */
+	virtual IOReturn getAWDL_SYNC_STATE(apple80211_awdl_sync_state *) = 0;           /* 0x1028 */
+	virtual IOReturn getAWDL_ELECTION_RSSI_THRESHOLDS(
+	    apple80211_awdl_election_rssi_thresholds *) = 0;                             /* 0x1030 */
+	virtual IOReturn getAWDL_PRESENCE_MODE(apple80211_awdl_presence_mode *) = 0;     /* 0x1038 */
+	virtual IOReturn getAWDL_ELECTION_PARAMS(apple80211_awdl_election_params *) = 0; /* 0x1040 */
+	virtual IOReturn getAWDL_DEVICE_CAPABILITIES(
+	    apple80211_awdl_device_capabilities *) = 0;                                  /* 0x1048 */
+	virtual IOReturn getAWDL_SECONDARY_MASTER_CHANNEL(
+	    apple80211_awdl_secondary_master_channel *) = 0;                             /* 0x1050 */
+	virtual IOReturn getAWDL_AF_TX_MODE(apple80211_awdl_af_tx_mode *) = 0;           /* 0x1058 */
+	virtual IOReturn getAWDL_MIN_RATE(apple80211_awdl_min_rate *) = 0;               /* 0x1060 */
+	virtual IOReturn getAWDL_ENCRYPTION_TYPE(apple80211_encrypt *) = 0;              /* 0x1068 */
+	virtual IOReturn getAWDL_TXCAL_PERIOD(apple80211_awdl_txcal_period *) = 0;       /* 0x1070 */
+	virtual IOReturn getAWDL_DEV_STATS(apple80211_awdl_dev_stats *) = 0;             /* 0x1078 */
+	virtual IOReturn getAWDL_DFSP_CONFIG(apple80211_awdl_dfsp_config *) = 0;         /* 0x1080 */
+	virtual IOReturn getAWDL_CCA(apple80211_awdl_cca *) = 0;                         /* 0x1088 */
+	virtual IOReturn getAWDL_AF_SECONDARY_PAYLOAD_CAPABILITIES(
+	    apple80211_awdl_cap *) = 0;                                                  /* 0x1090 */
+	virtual IOReturn getLLW_PARAMS(apple80211_llw_params *) = 0;                     /* 0x1098 */
+	virtual IOReturn setSSID(apple80211_ssid_data *) = 0;                            /* 0x10A0 */
+	virtual IOReturn setCHANNEL(apple80211_channel_data *) = 0;                      /* 0x10A8 */
+	virtual IOReturn setAWDL_SYNC_PARAMS(apple80211_awdl_sync_params *) = 0;         /* 0x10B0 */
+	virtual IOReturn setAWDL_SYNC_ENABLED(apple80211_awdl_sync_enabled *) = 0;       /* 0x10B8 */
+	virtual IOReturn setAWDL_EXTENSION_STATE_MACHINE_PARAMETERS(
+	    apple80211_awdl_extension_state_machine_parameter *) = 0;                    /* 0x10C0 */
+	virtual IOReturn setAWDL_ELECTION_ID(apple80211_awdl_election_id *) = 0;         /* 0x10C8 */
+	virtual IOReturn setAWDL_BSSID(apple80211_awdl_bssid *) = 0;                     /* 0x10D0 */
+	virtual IOReturn setAWDL_ELECTION_METRIC(apple80211_awdl_election_metric *) = 0; /* 0x10D8 */
+	virtual IOReturn setAWDL_SYNCHRONIZATION_CHANNEL_SEQUENCE(
+	    apple80211_awdl_sync_channel_sequence *) = 0;                                /* 0x10E0 */
+	virtual IOReturn setAWDL_MASTER_CHANNEL(apple80211_awdl_master_channel *) = 0;   /* 0x10E8 */
+	virtual IOReturn setAWDL_SYNC_STATE(apple80211_awdl_sync_state *) = 0;           /* 0x10F0 */
+	virtual IOReturn setAWDL_ELECTION_RSSI_THRESHOLDS(
+	    apple80211_awdl_election_rssi_thresholds *) = 0;                             /* 0x10F8 */
+	virtual IOReturn setAWDL_PRESENCE_MODE(apple80211_awdl_presence_mode *) = 0;     /* 0x1100 */
+	virtual IOReturn setPEER_CACHE_CONTROL(apple80211_peer_cache_control *) = 0;     /* 0x1108 */
+	virtual IOReturn setAWDL_OOB_REQUEST(apple80211_awdl_oob_request *) = 0;         /* 0x1110 */
+	virtual IOReturn setAWDL_SYNC_FRAME_TEMPLATE(
+	    apple80211_awdl_sync_frame_template *) = 0;                                  /* 0x1118 */
+	virtual IOReturn setAWDL_ELECTION_PARAMS(apple80211_awdl_election_params *) = 0; /* 0x1120 */
+	virtual IOReturn setAWDL_PEER_TRAFFIC_REGISTRATION(
+	    apple80211_awdl_peer_traffic_registration *) = 0;                            /* 0x1128 */
+	virtual IOReturn setAWDL_SECONDARY_MASTER_CHANNEL(
+	    apple80211_awdl_secondary_master_channel *) = 0;                             /* 0x1130 */
+	virtual IOReturn setAWDL_AF_TX_MODE(apple80211_awdl_af_tx_mode *) = 0;           /* 0x1138 */
+	virtual IOReturn setAWDL_MIN_RATE(apple80211_awdl_min_rate *) = 0;               /* 0x1140 */
+	virtual IOReturn setAWDL_ENCRYPTION_KEYS(apple80211_key *) = 0;                  /* 0x1148 */
+	virtual IOReturn setAWDL_ENCRYPTION_TYPE(apple80211_encrypt *) = 0;              /* 0x1150 */
+	virtual IOReturn setAWDL_OOB_AUTO_REQUEST(apple80211_awdl_oob_request *) = 0;    /* 0x1158 */
+	virtual IOReturn setAWDL_TXCAL_PERIOD(apple80211_awdl_txcal_period *) = 0;       /* 0x1160 */
+	virtual IOReturn setAWDL_AWDL_ADVERTISERS(awdl_peer_advert_add *) = 0;           /* 0x1168 */
+	virtual IOReturn setAWDL_DFSP_CONFIG(apple80211_awdl_dfsp_config *) = 0;         /* 0x1170 */
+	virtual IOReturn setAWDL_DFSP_UCSA_CONFIG(apple80211_awdl_dfsp_ucsa_config *) = 0; /* 0x1178 */
+	virtual IOReturn setCOMPANION_SKYWALK_IF_CREATE(
+	    apple80211_companion_skywalk_if_create *) = 0;                               /* 0x1180 */
+	virtual IOReturn setAWDL_OOB_SEC_PAYLOAD_REQUEST(
+	    apple80211_awdl_af_sec_payload_request *) = 0;                               /* 0x1188 */
+	virtual IOReturn setLLW_PARAMS(apple80211_llw_params *) = 0;                     /* 0x1190 */
+	virtual IOReturn setTX_RATE(apple80211_tx_rate *) = 0;                           /* 0x1198 */
+	virtual IOReturn setP2P_COEX_PROTECTION(apple80211_p2p_coex_protection *) = 0;   /* 0x11A0 */
+	virtual IOReturn setPSF_DWELL(apple80211_awdl_psf_dwell_params *) = 0;           /* 0x11A8 */
+	virtual IOReturn setAWDL_CONFIG(apple80211_awdl_config_request *) = 0;           /* 0x11B0 */
+	virtual IOReturn setAWDL_RTG_PEER_STATS_CONFIG(
+	    apple80211_rtg_peer_stats_cfg *) = 0;                                        /* 0x11B8 */
+};
+
+static_assert(sizeof(IO80211SkywalkInterface) == 0x128, "IO80211SkywalkInterface layout");
+static_assert(sizeof(IO80211VirtualInterface) == 0x130, "IO80211VirtualInterface layout");
+static_assert(sizeof(IO80211AWDLProtocol) == 0x130, "IO80211AWDLProtocol layout");
+
+/*
+ * awdl0. Role 6, name "awdl": the numeric role and the BSD prefix are the ones
+ * AppleBCMWLANProximityInterface passes to IO80211VirtualInterface::init.
+ * Every AWDL slot answers kIOReturnUnsupported in stage 1: the interface exists
+ * and is published, it does not run the AWDL state machine yet.
+ */
+class RTLLlwInterface;
+
+class RTLAwdInterface : public IO80211AWDLProtocol {
+	OSDeclareDefaultStructors(RTLAwdInterface)
+public:
+	bool initWithController(RTLAirController *ctrl, const uint8_t mac[6]);
+	bool startWithRegistration(RTLAirController *ctrl);
+	void stop(IOService *provider) override;
+	void free() override;
+	const char *bsdName() const { return _bsdName; }
+	/* llw0, for the power tree (nullptr until wifip2pd asks for it). */
+	IOService *companion() const;
+	/* A new radio after a USB re-enumeration: hooks and port 1 again. */
+	void radioBack();
+	void radioGone();
+	/* One Ethernet II frame from llw0: same MAC, same peers, same ring. */
+	void companionTx(const uint8_t *eth, uint32_t len);
+	/* Largest IP packet the TX ring carries: the MTU of awdl0 and llw0. */
+	static uint32_t dataMtu();
+	/* Runtime knobs (Tools/awdlknob): RTLAwdlBss, RTLAwdlMcc and RTLAwdlMccRun
+	 * change _bssAllowed, _mccMode and _mccRun without a reboot, and
+	 * RTLAwdlAggSgi, RTLAwdlAggMcs9, RTLAwdlAggDen and RTLAwdlAggBurst the
+	 * A-MPDU's _aggSgiAllowed, _aggMcs9Allowed, _aggDensity and _aggBurstUs. Overrides
+	 * IORegistryEntry::setProperties, the cell IO80211AWDLProtocol's vtable
+	 * has: no new vtable entry. */
+	IOReturn setProperties(OSObject *props) override;
+
+	/* COMPANION_SKYWALK_IF_CREATE (type 293): wifip2pd asks for llw0 right
+	 * after awdl0 is up (Docs/AWDL_LLW_COMPANION.md, AWDL_STAGE4_LLW_CLOSURE.md).
+	 * Off unless rtlawdl_llw=1: it answers unsupported, as before. */
+	IOReturn setCOMPANION_SKYWALK_IF_CREATE(apple80211_companion_skywalk_if_create *req) override;
+
+	uintptr_t setMacAddress(ether_addr &) override { return kIOReturnSuccess; }
+	uintptr_t prepareBSDInterface(__ifnet *ifp, unsigned int unit) override;
+	uintptr_t getSupportedMediaArray(unsigned int *media, unsigned int *count) override;
+	uintptr_t enable(unsigned int opts) override;
+	uintptr_t disable(unsigned int opts) override;
+
+	/* Group-addressed packets while peers exist: the peer manager stashes
+	 * them and hands them over in the availability window from
+	 * handleMulticastTimer, which frees with freeMulticastPacket the ones not
+	 * taken. The family's own bodies drop them. */
+	uintptr_t p2pMulticastTx(IO80211NetworkPacket **pkts, unsigned int count) override;
+	uintptr_t freeMulticastPacket(IO80211NetworkPacket *pkt) override;
+
+	/* Stage 3: the setters IO80211AWDLPeerManager::configure() sends through
+	 * ioctl_internal (types 125, 122, 132, 135, 213, 134) and the ones interfaceStateChange()/enableAWDL() send after it (116, 117, 226) and the setters of the channel sequence, election, sync frame template, secondary master, AF TX mode, advertisers, extension state machine and PSF dwell (129, 155, 151, 205, 208, 229, 126, 118, 418). It aborts on the first
+	 * one that fails, which leaves _stateFlags bit 0 clear and every peer service
+	 * request answered with 6. They only acknowledge: nothing reaches the radio. */
+#define AWDL_ACK(name, type) IOReturn name(type *) override;
+	AWDL_ACK(setAWDL_BSSID, apple80211_awdl_bssid)
+	AWDL_ACK(setAWDL_ELECTION_ID, apple80211_awdl_election_id)
+	AWDL_ACK(setAWDL_MASTER_CHANNEL, apple80211_awdl_master_channel)
+	AWDL_ACK(setAWDL_ELECTION_RSSI_THRESHOLDS,
+	         apple80211_awdl_election_rssi_thresholds)
+	AWDL_ACK(setAWDL_MIN_RATE, apple80211_awdl_min_rate)
+	AWDL_ACK(setAWDL_SYNC_STATE, apple80211_awdl_sync_state)
+	AWDL_ACK(setAWDL_SYNC_PARAMS, apple80211_awdl_sync_params)
+	AWDL_ACK(setAWDL_SYNC_ENABLED, apple80211_awdl_sync_enabled)
+	AWDL_ACK(setAWDL_TXCAL_PERIOD, apple80211_awdl_txcal_period)
+	AWDL_ACK(setAWDL_SYNCHRONIZATION_CHANNEL_SEQUENCE,
+	         apple80211_awdl_sync_channel_sequence)
+	AWDL_ACK(setAWDL_ELECTION_PARAMS, apple80211_awdl_election_params)
+	/* Also keeps a copy of the template for the action frame TX. */
+	AWDL_ACK(setAWDL_SYNC_FRAME_TEMPLATE,
+	         apple80211_awdl_sync_frame_template)
+	AWDL_ACK(setAWDL_SECONDARY_MASTER_CHANNEL,
+	         apple80211_awdl_secondary_master_channel)
+	AWDL_ACK(setAWDL_AF_TX_MODE, apple80211_awdl_af_tx_mode)
+	AWDL_ACK(setAWDL_AWDL_ADVERTISERS, awdl_peer_advert_add)
+	AWDL_ACK(setAWDL_ELECTION_METRIC, apple80211_awdl_election_metric)
+	AWDL_ACK(setAWDL_EXTENSION_STATE_MACHINE_PARAMETERS,
+	         apple80211_awdl_extension_state_machine_parameter)
+	AWDL_ACK(setPSF_DWELL, apple80211_awdl_psf_dwell_params)
+	/* The master indication template (Docs/AWDL_PSF_MIF_EMISSION.md §2.2,
+	 * §2.3): 149 sends one MIF (broadcast) or UMI (unicast) in the next
+	 * window, 225 keeps the template for every MIF. */
+	AWDL_ACK(setAWDL_OOB_REQUEST, apple80211_awdl_oob_request)
+	AWDL_ACK(setAWDL_OOB_AUTO_REQUEST, apple80211_awdl_oob_request)
+	/* A peer's traffic registration (type 164), sent once a service wants
+	 * data with it; the radio keeps no per-peer state. */
+	AWDL_ACK(setAWDL_PEER_TRAFFIC_REGISTRATION, apple80211_awdl_peer_traffic_registration)
+#undef AWDL_ACK
+
+	/* The peer cache (types 143 and 130). IO80211P2PDataPathManager::
+	 * addPeerToFWCache marks a peer cached only when the 143 add succeeds,
+	 * and IO80211PeerManager::preQueuePacket drops every packet to a peer
+	 * that is not: the radio keeps no per-peer state, so both are answered
+	 * here. The size limit is the family's own default, 8. */
+	IOReturn setPEER_CACHE_CONTROL(apple80211_peer_cache_control *req) override;
+	IOReturn getPEER_CACHE_MAXIMUM_SIZE(apple80211_peer_cache_maximum_size *out) override;
+	/* Sync enabled (type 117). wifip2pd reads it once when it builds its
+	 * AWDL interface object and keeps the answer as the flag that lets it
+	 * publish a peer's presence (the awdl0 neighbour entry and ioctl 415)
+	 * from the peer's action frames; an error or 0 leaves that path off for
+	 * the life of the interface. See Docs/AWDL_RESULTADO_IPHONE_1.md §4. */
+	IOReturn getAWDL_SYNC_ENABLED(apple80211_awdl_sync_enabled *out) override;
+
+#define AWDL_STUB(name, type) \
+	IOReturn name(type *) override { return kIOReturnUnsupported; }
+	AWDL_STUB(getSSID, apple80211_ssid_data)
+	AWDL_STUB(getCHANNEL, apple80211_channel_data)
+	AWDL_STUB(getBSSID, apple80211_bssid_data)
+	AWDL_STUB(getSTATE, apple80211_state_data)
+	AWDL_STUB(getAWDL_SYNC_PARAMS, apple80211_awdl_sync_params)
+	AWDL_STUB(getAWDL_EXTENSION_STATE_MACHINE_PARAMETERS,
+	          apple80211_awdl_extension_state_machine_parameter)
+	AWDL_STUB(getAWDL_ELECTION_ID, apple80211_awdl_election_id)
+	AWDL_STUB(getAWDL_ELECTION_METRIC, apple80211_awdl_election_metric)
+	AWDL_STUB(getAWDL_SYNCHRONIZATION_CHANNEL_SEQUENCE,
+	          apple80211_awdl_sync_channel_sequence)
+	AWDL_STUB(getAWDL_MASTER_CHANNEL, apple80211_awdl_master_channel)
+	AWDL_STUB(getAWDL_SYNC_STATE, apple80211_awdl_sync_state)
+	AWDL_STUB(getAWDL_ELECTION_RSSI_THRESHOLDS,
+	          apple80211_awdl_election_rssi_thresholds)
+	AWDL_STUB(getAWDL_PRESENCE_MODE, apple80211_awdl_presence_mode)
+	AWDL_STUB(getAWDL_ELECTION_PARAMS, apple80211_awdl_election_params)
+	AWDL_STUB(getAWDL_DEVICE_CAPABILITIES, apple80211_awdl_device_capabilities)
+	AWDL_STUB(getAWDL_SECONDARY_MASTER_CHANNEL,
+	          apple80211_awdl_secondary_master_channel)
+	AWDL_STUB(getAWDL_AF_TX_MODE, apple80211_awdl_af_tx_mode)
+	AWDL_STUB(getAWDL_MIN_RATE, apple80211_awdl_min_rate)
+	AWDL_STUB(getAWDL_ENCRYPTION_TYPE, apple80211_encrypt)
+	AWDL_STUB(getAWDL_TXCAL_PERIOD, apple80211_awdl_txcal_period)
+	AWDL_STUB(getAWDL_DEV_STATS, apple80211_awdl_dev_stats)
+	AWDL_STUB(getAWDL_DFSP_CONFIG, apple80211_awdl_dfsp_config)
+	AWDL_STUB(getAWDL_CCA, apple80211_awdl_cca)
+	AWDL_STUB(getAWDL_AF_SECONDARY_PAYLOAD_CAPABILITIES, apple80211_awdl_cap)
+	AWDL_STUB(getLLW_PARAMS, apple80211_llw_params)
+	AWDL_STUB(setSSID, apple80211_ssid_data)
+	AWDL_STUB(setCHANNEL, apple80211_channel_data)
+	/* Accepted: the manager keeps the presence mode only when the driver takes it. */
+	IOReturn setAWDL_PRESENCE_MODE(apple80211_awdl_presence_mode *) override;
+	AWDL_STUB(setAWDL_ENCRYPTION_KEYS, apple80211_key)
+	AWDL_STUB(setAWDL_ENCRYPTION_TYPE, apple80211_encrypt)
+	AWDL_STUB(setAWDL_DFSP_CONFIG, apple80211_awdl_dfsp_config)
+	AWDL_STUB(setAWDL_DFSP_UCSA_CONFIG, apple80211_awdl_dfsp_ucsa_config)
+	AWDL_STUB(setAWDL_OOB_SEC_PAYLOAD_REQUEST,
+	          apple80211_awdl_af_sec_payload_request)
+	AWDL_STUB(setLLW_PARAMS, apple80211_llw_params)
+	AWDL_STUB(setTX_RATE, apple80211_tx_rate)
+	AWDL_STUB(setP2P_COEX_PROTECTION, apple80211_p2p_coex_protection)
+	AWDL_STUB(setAWDL_CONFIG, apple80211_awdl_config_request)
+	AWDL_STUB(setAWDL_RTG_PEER_STATS_CONFIG, apple80211_rtg_peer_stats_cfg)
+#undef AWDL_STUB
+
+private:
+	RTLAirController *_ctrl;
+	void *_txPool, *_rxPool;
+	void *_txSubQ, *_txCompQ, *_rxCompQ;
+	uint8_t *_regInfo;          /* IOSkywalkEthernetInterface::RegistrationInfo */
+	uint8_t _mac[6];
+	char _bsdName[16];
+	RTLLlwInterface *_llw;      /* the companion, once created */
+	bool _llwAllowed;
+
+	bool createDatapath();
+	void destroyCompanion();
+	void teardownDatapath();
+	static IOReturn txData(OSObject *owner, void *queue, void *const *pkts,
+	                       uint32_t count, void *refCon);
+	static IOReturn removeQueues(OSObject *owner, void *, void *, void *, void *);
+
+	/* RX of AWDL frames from the radio (RTL_RADIO_FN_AWDL_HOOK): the hook
+	 * queues copies, a thread call hands the action frames to the peer
+	 * manager through bpfTapInput on the work queue. */
+	IOLock *_rxLock;
+	mbuf_t _rxHead, _rxTail;
+	uint32_t _rxCount;
+	thread_call_t _rxDrain;
+	bool _rxHooked;
+	bool _rxAllowed;            /* boot-arg rtlawdl_rx, 1 unless set to 0 */
+	uint64_t _rxAf, _rxData, _rxOther, _rxDropped;
+	uint64_t _rxLagMax;         /* longest arrival-to-drain delay of an AF since the last log */
+	uint64_t _rxDataUp, _rxDataBad, _rxDataNotUs, _rxDataFail, _rxDataWrapped;
+	/* Plain RFC 1042 MSDUs (no AWDL head): llw0's traffic. */
+	uint64_t _rxDataPlain, _rxDataPlainLost;
+
+	/* Block Ack recipient sessions (Docs/AWDL_BLOCK_ACK.md): the layer answers
+	 * a peer's ADDBA request and keeps a reorder window per (peer, TID); the
+	 * MAC sends the BlockAck frames itself. Boot-arg rtlawdl_ba=0 declines
+	 * every request (status 37), as before. Under _baLock; the frames are
+	 * delivered with it dropped. */
+	struct AwdlBaSession {
+		uint8_t peer[6];
+		uint8_t tid;
+		bool on;
+		uint16_t ws;            /* next sequence number expected, 12 bits */
+		uint16_t win;           /* agreed window, 1..64 */
+		uint16_t held;          /* frames waiting in slot[] */
+		uint16_t oldRun;        /* frames in a row behind the window */
+		uint64_t heldUs;        /* when the oldest waiting frame arrived */
+		uint64_t lastUs;        /* last frame or request, 0 = free */
+		mbuf_t slot[64];        /* by sequence number modulo 64 */
+	};
+	IOLock *_baLock;
+	bool _baAllowed;
+	bool _baRefuse;             /* the peers keep tearing sessions down: decline */
+	enum { kBaSessions = 8 };   /* TIDs 0-7 of one peer, or a few peers */
+	AwdlBaSession _ba[kBaSessions];
+	uint64_t _baReq, _baAccept, _baDecline, _baDelba, _baHeld, _baTimeout, _baOld, _baDup;
+	uint64_t _baDelbaUs;         /* first DELBA of the current run */
+	uint32_t _baDelbaRun;       /* DELBAs from peers since _baDelbaUs */
+	uint64_t _baRefuseUs;       /* when _baRefuse was set; it lapses after AWDL_BA_REFUSE_US */
+	bool baExpireDue(uint64_t now);
+	void handleBlockAck(mbuf_t m);
+	void rxReorder(mbuf_t m);
+	uint32_t baRelease(AwdlBaSession *s, mbuf_t *out, uint32_t cap, bool skipHoles);
+	void baExpire(uint64_t now);
+	void baClose(AwdlBaSession *s, mbuf_t *out, uint32_t *n, uint32_t cap);
+	void baFlushAll(bool deliver);
+	bool queueMgmt(const uint8_t *frame, uint16_t len);
+
+	void setRadioRx(bool on);
+	void flushRadioRx();
+	void injectFrame(mbuf_t m);
+	void deliverData(mbuf_t m);
+	static void radioRxHook(void *ctx, const uint8_t *frame, uint32_t len,
+	                        int8_t rssi, uint8_t channel);
+	static void rxDrainEntry(thread_call_param_t p0, thread_call_param_t);
+	static IOReturn bpfTapAction(OSObject *owner, void *m, void *hdr, void *, void *);
+
+	/* TX of AWDL action frames and the availability windows (boot-arg
+	 * rtlawdl_tx=1): PSF every 110 TU and a MIF in each served slot, built
+	 * from the kernel's sync frame template (151) plus the TLVs 4, 5 and 18
+	 * rendered here; events 41/43 at the edges of the served slots. */
+	IOLock *_txLock;            /* template and clock */
+	thread_call_t _txTick;
+	bool _txAllowed;
+	bool _txOn;
+	bool _tickBusy;             /* a txTick is running; it rearms itself */
+	uint8_t _tpl[0x724];        /* sync template (151), Broadcom's firmware buffer size */
+	uint32_t _tplLen;
+	uint8_t _miTpl[1200];       /* MI template of the last 225 or broadcast 149, the kernel's size */
+	uint32_t _miTplLen;
+	bool _mifNow;               /* a broadcast 149: one MIF in the next window */
+	struct {                    /* unicast 149s waiting for the next window */
+		uint8_t dst[6];
+		uint16_t len;
+		uint8_t tpl[sizeof(_miTpl)]; /* this UMI's own, without the service TLVs */
+	} _umi[4];
+	uint8_t _umiCount;
+	uint64_t _txUmi, _txUmiDrop;
+	/* The UMIs' delivery reports from the radio, posted as event 69 (tick only) */
+	bool _afStatOff, _afStatInit, _afUnmatchedLogged;
+	uint32_t _afHead;           /* the radio's ring head already posted */
+	uint64_t _ev69Ack, _ev69Fail, _ev69Missed;
+	void postAfStatus();
+	uint8_t _afBuf[1488];       /* sendAf, tick only: the radio's frame limit */
+	uint64_t _clkBaseUs;        /* start of the slot whose first AW is _clkBaseAw */
+	uint16_t _clkBaseAw;
+	uint64_t _nextPsfUs;
+	uint32_t _lastMifSlot;
+	uint32_t _lastTickAw;
+	uint8_t _seq[16];           /* channel per slot from the 129 */
+	uint32_t _seqVer[16];
+	uint32_t _seqFlags[16];
+	bool _seqValid;
+	uint8_t _seqLogs;           /* sequence changes logged so far */
+	bool _awOpen;              /* between events 41 and 43 */
+	bool _awPosted;             /* the open window was posted (event 41): not a dense-only slot */
+	uint8_t _offSocialCh;       /* last non-social channel logged */
+	uint8_t _parkCh;            /* preferred social channel while not associated
+	                             * (boot-arg rtlawdl_ch, 149 by default), used until
+	                             * a 129 names another; 0 = no parking */
+	uint64_t _parkReqUs;        /* last rtlRadioSetChannel request */
+	/* Time sharing while en2 is associated on a non-social channel (boot-arg
+	 * rtlawdl_mcc: 0 off, 1 the first slot of each run of the social channel
+	 * in the 129, 2 all of its slots): rtlRadioAwdlOffch takes the radio there
+	 * for those slots only. _mccLock orders the switches against tx off.
+	 * _mccMode, _mccRun and _bssAllowed are also the knobs of setProperties,
+	 * written under _txLock; txTick reads _mccMode and _bssAllowed once per
+	 * tick under it. */
+	uint32_t _mccMode;
+	uint32_t _mccCross;         /* boot-arg rtlawdl_mccx: serve 149 from a 2.4 GHz BSS (band switch) */
+	uint32_t _mccRun;           /* boot-arg rtlawdl_mccrun: slots in a row a transfer takes from the BSS, 0 = none */
+	uint32_t _mccAw;            /* boot-arg rtlawdl_mccaw, 1..4: AWs of a served slot
+	                             * spent there with nothing to send; 0 = by peers */
+	uint32_t _mccDwell;         /* the same, for the slot txTick is in */
+	uint64_t _mccPeerUs;        /* last action frame from a peer, 0 = none */
+	bool _mccOff;              /* the driver has no rtlRadioAwdlOffch */
+	bool _mccActive;            /* servedMask keeps to _mccServe */
+	uint16_t _mccServe;
+	uint8_t _mccCur;            /* channel the radio was sent to, 0 = the BSS */
+	uint8_t _mccTarget;         /* social channel served while associated, 0 = none */
+	/* The slots the 129 gives the BSS's own channel, served there while the
+	 * radio is on the BSS (boot-arg rtlawdl_bss, 1 unless set to 0; AWDLShare.h
+	 * awdlShareBss). Not during a scan: the radio may leave the BSS at any time
+	 * in one, unlike a time-sharing visit, which the scan waits for. */
+	bool _bssAllowed;
+	uint8_t _bssLogCh;          /* channel and slots of the last "serving" log */
+	uint16_t _bssLogMask;
+	uint8_t _bssLogs;
+	uint64_t _ev41Bss;          /* windows (event 41) on the BSS's channel, of _ev41 */
+	uint64_t _txDataBss;        /* data frames sent there */
+	/* The RTLAwdlKnobs property: the knobs, the windows of _ev41 split by
+	 * _ev41Bss, and _txDataBss; set outside _txLock, as RTLAwdlLog is. */
+	void publishKnobs();
+	/* The AWDL status for the registry and the radio's LED: RTLAwdlPeers,
+	 * the peers unicast data went to or came from in the last
+	 * AWDL_DATA_PEER_US (_dataPeer, under _txLock), and RTLAwdlChannel, the
+	 * social channel served. txTick gives them to publishStatus, which sets
+	 * the properties and calls rtlRadioAwdlPeers only when they change, under
+	 * _mccLock, which orders it against tx off (zero both). The RX side notes
+	 * a peer again at most every AWDL_DATA_PEER_NOTE_US (_rxDataPeer*, the RX
+	 * drain only), so a transfer takes _txLock a few times a second for it. */
+	struct AwdlDataPeer {
+		uint8_t mac[6];
+		uint64_t lastUs;        /* 0 = empty */
+	};
+	AwdlDataPeer _dataPeer[8];
+	uint8_t _rxDataPeerMac[6];
+	uint64_t _rxDataPeerUs;
+	uint32_t _statPeers;        /* RTLAwdlPeers as published */
+	uint8_t _statCh;            /* RTLAwdlChannel as published */
+	bool _statInit;             /* both published once */
+	uint32_t _statPeersSent;    /* the count the radio has */
+	bool _statPeersOff;         /* the radio has no rtlRadioAwdlPeers */
+	uint64_t _statPeersRetryUs; /* a refused call is not repeated before this */
+	void noteDataPeer(const uint8_t *mac, uint64_t now);
+	uint32_t dataPeers(uint64_t now) const;
+	void publishStatus(uint32_t peers, uint8_t ch, bool tick);
+	uint64_t _mccPreUs;         /* slot start a tick armed early switches for, 0 = none */
+	uint64_t _scanTailUs;       /* a scan just ended: serve as in a return until then */
+	bool     _scanSeen;         /* txTick saw a scan running */
+	IOLock *_mccLock;
+	uint64_t _mccSwitches, _mccFail, _mccUsMax, _mccUsSum, _mccEarly;
+	uint32_t _mccLeaveUs[8];     /* last switches to the AWDL channel, us (txTick's lead) */
+	uint8_t _mccLeaveIdx;
+	uint8_t _clkMaster[6];      /* master the AW clock follows (alignClock) */
+	uint64_t _clkMasterUs;      /* last frame from it, 0 = none */
+	/* Operating class of the served slots in TLV 4 and 18, from the width the
+	 * radio has on the channel (rtlRadioAwdlWidth): a peer sends no wider than
+	 * a slot's class says. txTick asks outside _txLock and stores it under it;
+	 * annClass gives it for _annCh, the 20 MHz class for any other channel.
+	 * Entry 0 is the social channel, entry 1 the BSS's own (_bssAllowed). */
+	uint8_t _annCh[2];          /* channel _annClass is for, 0 = none yet */
+	uint8_t _annClass[2];
+	bool _annOff;               /* the radio has no rtlRadioAwdlWidth: 20 MHz classes */
+	uint64_t _annKey[2];        /* channel and radio state of the last answer */
+	uint64_t _annAskUs[2];      /* when it came, 0 = ask at the next tick */
+	void updateAnnounce(uint8_t ch, const struct rtl_radio_status &st, int which = 0);
+	uint8_t annClass(uint8_t ch) const;
+
+	/* AWDL data TX: frames built from awdl0's TX submission packets wait in a
+	 * ring until the window of a served slot is open (txTick). Under _txLock;
+	 * the radio is only called with it dropped. */
+	struct AwdlTxFrame {
+		uint32_t tsUs;          /* low 32 bits of awdlNowUs() when queued */
+		uint16_t len;
+		uint8_t frame[24 + 16 + 1428];  /* 802.11 + AWDL data header + MTU */
+	};
+	struct AwdlTxSeq {
+		uint8_t da[6];
+		uint16_t seq;
+		uint64_t lastUs;
+	};
+	AwdlTxFrame *_txRing;
+	uint32_t _txRingHead, _txRingCount;
+	AwdlTxSeq _txSeqTab[16];
+	bool _txDataOff;            /* the radio refused a data frame (older driver) */
+	bool _port1On;              /* rtlRadioAwdlPort took awdl0's MAC */
+	uint64_t _txDataQueued, _txDataSent, _txDataDropFull, _txDataDropOld, _txDataDropBad,
+	         _txDataFail;
+	uint64_t _txDataBusy;       /* batches the radio ended with a transient refusal */
+	uint32_t _txAirUs;          /* data air time per AW tick (rtlawdl_air) */
+	bool _txLastAw;             /* data also in a slot's last AW (rtlawdl_lastaw) */
+	uint64_t _txMcast;          /* p2pMulticastTx batches */
+	uint64_t _peerCacheOps;     /* setPEER_CACHE_CONTROL requests */
+	uint8_t _pccDst[8][6];      /* their answers, event 51, for the next tick */
+	uint8_t _pccOp[8];
+	uint8_t _pccCount;
+	void postPeerCache(uint8_t op, const uint8_t *mac);
+
+	/* Each peer's channel sequence as it announces it (notePeerSeq), so data
+	 * waits for a slot the destination is on this channel. Under _txLock. */
+	struct AwdlPeerSeq {
+		uint8_t mac[6];
+		uint8_t ch[16];
+		uint64_t lastUs;        /* 0 = empty, or its slots are not ours to compare */
+	};
+	AwdlPeerSeq _peerSeq[8];
+	uint64_t _txDataHeld;       /* ticks that stopped at a frame whose peer is away */
+	void notePeerSeq(mbuf_t m, const uint8_t *src);
+	bool peerOnChannel(const uint8_t *da, uint32_t slot, uint8_t ch, uint64_t now) const;
+
+	void queueData(const uint8_t *eth, uint32_t len, bool plain = false);
+	void flushRadioTx();
+
+	/* The data pump. txTick runs once per AW and sets what data may do in it:
+	 * whether a window is open (_pumpOk), its slot and channel, when it ends
+	 * and how much air it has left. pumpData sends from the ring within that,
+	 * from the tick and from its own thread call: a frame queued in the middle
+	 * of an AW kicks it, and a radio that was full is tried again 1 ms later,
+	 * so a window is used whole and not only at its start. One sender at a
+	 * time (_sendBusy), so the frames keep their order. All under _txLock.
+	 * Boot-arg rtlawdl_pump=0 leaves only the tick's call. */
+	thread_call_t _txPump;
+	bool _pumpAllowed;
+	bool _sendBusy;
+	bool _pumpOk;
+	bool _pumpStall;            /* this AW has no more to give (air spent, or the peer is away) */
+	uint8_t _pumpCh;
+	uint32_t _pumpSlot, _pumpAw, _pumpAir;
+	uint64_t _pumpEndUs;
+	uint64_t _txPumpRuns;
+	static void pumpEntry(thread_call_param_t p0, thread_call_param_t p1);
+	void armPump(uint64_t deadline);
+	void pumpData();
+
+	/* A-MPDU to a peer (AWDLBaOrig.h): a Block Ack agreement the layer asks
+	 * for once a peer gets a run of unicast data, then that peer's data goes
+	 * as QoS data the radio joins into A-MPDUs at a VHT rate
+	 * (rtlRadioAwdlAgg), picked from the peers' signal like the single-frame
+	 * rate. _bao under _txLock; the rate fields from txTick only. Boot-args
+	 * rtlawdl_agg=0 (off), rtlawdl_aggwd=0 (never close a silent session),
+	 * rtlawdl_aggmax, rtlawdl_aggden, rtlawdl_aggbw, rtlawdl_aggsgi=0 (long
+	 * guard interval always), rtlawdl_aggmcs9=0 (no MCS 9), rtlawdl_aggburst.
+	 * The four of them also as knobs (setProperties), under _txLock. */
+	AwdlBaoTab _bao;
+	bool _aggAllowed;
+	bool _aggOff;               /* the radio has no rtlRadioAwdlAgg */
+	bool _aggSet;               /* the radio took a rate: requests may go */
+	uint8_t _aggIdx, _aggBw;
+	uint32_t _aggMbps;          /* of that rate at the radio's width; under _txLock */
+	uint32_t _aggMax, _aggBwMax;
+	uint32_t _aggDensity;       /* density code 0..7, or 8: the one the peers ask for */
+	bool _aggSgiAllowed;        /* short guard interval for peers that announce it */
+	bool _aggMcs9Allowed;       /* MCS 9 at 40 and 80 MHz for peers that announce it */
+	uint32_t _aggBurstUs;       /* air of an A-MPDU's preamble, BlockAck and backoff;
+	                             * 0 = AWDL_TX_AGG_FRAME_US for every MPDU instead */
+	bool _aggSgi;               /* what the radio has now, for pumpData; under _txLock */
+	uint8_t _aggDen;
+	/* Each peer's HT and VHT capabilities as its action frames carry them
+	 * (TLV 7 and 17, notePeerSeq): the A-MPDU density it asks for, the short
+	 * guard interval and two streams up to VHT MCS 9. Under _txLock. */
+	struct AwdlPeerCaps {
+		uint8_t mac[6];
+		bool ht;                /* TLV 7 seen: density is the peer's */
+		uint8_t density;        /* A-MPDU minimum MPDU start spacing, code 0..7 */
+		uint8_t sgi;            /* bit 0 at 20 MHz, bit 1 at 40 (TLV 7), bit 2 at 80 (TLV 17) */
+		bool mcs9;              /* TLV 17: two streams up to MCS 9 */
+		uint64_t lastUs;        /* 0 = empty */
+	};
+	AwdlPeerCaps _peerCaps[8];
+	const AwdlPeerCaps *peerCaps(const uint8_t *mac, uint64_t now) const;
+	uint64_t _aggUs, _aggWatchUs, _aggChanges;
+	uint64_t _txDataAgg;        /* data frames sent as QoS data of a session */
+	uint8_t _txQos[24 + 2 + 16 + 1428]; /* the frame pumpData is sending, as QoS data */
+	void aggRate(uint64_t now);
+	uint64_t _txPsf, _txMif, _txFail, _clkAligned, _ev41, _ev43;
+
+	void setRadioTx(bool on);
+	void txTick();
+	void armTick(uint64_t deadline);
+	uint8_t parkRadio(uint8_t idleCh, uint64_t nowUs, bool infraBusy);
+	uint8_t mccChannel(uint8_t home, uint64_t nowUs, bool backop);
+	bool mccSwitch(uint8_t want);
+	uint16_t servedMask(uint8_t ch) const;
+	/* Dense presence (MtkWireless 1.0.3, docs/AIRDROP-PERFORMANCE.md): awdld
+	 * keeps its idle sequence during AirDrop, 2 of 16 slots on the data
+	 * channel, and a peer only sends in slots we announce. While data flows
+	 * every slot the 129 leaves at 0 is announced and served too, unless the
+	 * radio is time-shared with a BSS on another channel. Boot-arg
+	 * rtlawdl_dense=0 turns it off. Under _txLock. */
+	bool _denseAllowed;
+	bool _dense;
+	uint8_t _denseRun;	/* busy bits of the last 4 samples, newest in bit 0 */
+	uint64_t _denseFrames, _denseSampleUs, _denseBusyUs, _denseChanges;
+	uint64_t _denseQueued;	/* _txDataQueued at the last sample */
+	bool updateDense(uint64_t now, bool off);
+	/* TX rate ladder for unicast data (MtkWireless 1.0.3): OFDM 6/12/24/36/48/
+	 * 54 Mb/s, then HT MCS 7 with the boot-arg rtlawdl_ratemax=6. The radio
+	 * reports every frame sent at the ladder's rate (CCX TX report): 32 clean
+	 * ones climb a step, a failed probe or two failures within 128 clean ones
+	 * go down, and a failed probe waits 256 << backoff clean frames before the
+	 * next. Starts at 12 Mb/s, the old fixed rate; rtlawdl_rate=0 keeps it.
+	 * From txTick only, outside _txLock. */
+	bool _rateOff;
+	uint8_t _rateIdx, _rateMax, _rateBackoff;
+	bool _rateProbe, _rateFailed, _rateSet, _rateEverClean;
+	uint32_t _rateOk, _rateCleanRun, _rateHold;
+	uint32_t _rateLast[4];
+	uint64_t _rateChanges, _rateSentAt;
+	uint32_t _rateLastReports, _ratePollLeft;
+	/* Without TX reports the rate follows the peers' signal instead: the
+	 * RTL8814AU sent no report for 984 data frames (2026-11-09). */
+	bool _rateByRssi;
+	uint32_t _rateNoRpt;        /* data frames sent while the radio reported none */
+	int32_t _peerRssi16;        /* peers' RSSI, dBm x 16, smoothed over 8 frames; under _txLock */
+	uint64_t _peerRssiUs, _rateRssiUs;
+	void rateByRssi(uint64_t now);
+	void updateRate();
+	bool setRate(uint8_t idx);
+	/* planCh and planOc: the channel and operating class of each of the 16
+	 * slots, as TLV 4 and 18 announce them (awdlSharePlan). */
+	bool sendAf(uint8_t subtype, uint8_t channel, const uint8_t *planCh, const uint8_t *planOc,
+	            bool umi = false);
+	size_t buildAf(uint8_t *out, size_t cap, uint8_t subtype, uint8_t channel,
+	               const uint8_t *planCh, const uint8_t *planOc, bool umi);
+	bool copyMiTemplate(const uint8_t *req);
+	void alignClock(mbuf_t m, const uint8_t *src);
+	static void txTickEntry(thread_call_param_t p0, thread_call_param_t);
+};
+
+/* Fails to compile if a pure slot is left unanswered, which would put
+ * __cxa_pure_virtual in the vtable the family calls. */
+static_assert(__is_abstract(IO80211AWDLProtocol), "IO80211AWDLProtocol is abstract");
+static_assert(!__is_abstract(RTLAwdInterface), "RTLAwdInterface must override every pure slot");
+
+/*
+ * llw0, the low latency companion of awdl0. Same family chain as
+ * AppleBCMWLANLowLatencyInterface (an infra protocol interface, role 2,
+ * BSD prefix llw, interface id 9) with awdl0 as its parent: the family's
+ * start takes the parent's peer manager for role 2. It has no radio of its
+ * own: what it sends goes into awdl0's TX ring without the AWDL head (plain
+ * RFC 1042), and awdl0's RX hands it the plain RFC 1042 MSDUs, the way the
+ * iPhone carries Continuity Camera's stream.
+ */
+class RTLLlwInterface : public RTLAirInterfaceStubs {
+	OSDeclareDefaultStructors(RTLLlwInterface)
+public:
+	bool initWithParent(RTLAirController *ctrl, RTLAwdInterface *awdl, const uint8_t mac[6]);
+	bool startWithRegistration(RTLAirController *ctrl);
+	void stop(IOService *provider) override;
+	void free() override;
+	uintptr_t enable(unsigned int opts) override;
+	uintptr_t disable(unsigned int opts) override;
+	/* What the infra chain calls when llw0 goes up or down; enable() and
+	 * disable() are not called for it. */
+	uintptr_t setInterfaceEnable(bool on) override;
+	uintptr_t prepareBSDInterface(__ifnet *ifp, unsigned int unit) override;
+	uintptr_t getSupportedMediaArray(unsigned int *media, unsigned int *count) override;
+	/* Only the Skywalk part: the infra one waits on the work loop the 293
+	 * handler holds while llw0 is being registered. */
+	IOReturn setPowerState(unsigned long ordinal, IOService *device) override;
+	/* Its own ifnet unique id: the Ethernet default is the MAC, which awdl0
+	 * already holds, and dlil answers EBUSY to a second user of it. */
+	uintptr_t initBSDInterfaceParameters(ifnet_init_eparams *params, sockaddr_dl **ll) override;
+	const char *bsdName() const { return _bsdName; }
+	/* awdl0 is going away: no more frames to it. */
+	void detachParent();
+	/* One received MSDU from awdl0's RX path, up as Ethernet II. */
+	bool rxPlain(const uint8_t *da, const uint8_t *sa, const uint8_t *type,
+	             const uint8_t *payload, size_t plen);
+
+private:
+	RTLAwdInterface *_awdl;    /* retained until free() */
+	IOLock *_awdlLock;
+	bool _parentLive;          /* cleared by detachParent(), under _awdlLock */
+	void *_txPool, *_rxPool;
+	void *_txSubQ, *_txCompQ, *_rxCompQ;
+	uint8_t *_regInfo;
+	uint8_t _mac[6];
+	uint8_t _uniqueId[8];     /* MAC + "ll" */
+	char _bsdName[16];
+	uint32_t _txFrames;
+	uint64_t _rxFrames, _rxDropped;
+
+	bool createDatapath();
+	void setActive(bool on);
+	static IOReturn removeQueues(OSObject *owner, void *, void *, void *, void *);
+	static IOReturn switchQueues(OSObject *owner, void *on, void *, void *, void *);
+	static IOReturn rxPlainAction(OSObject *owner, void *args, void *, void *, void *);
+	static IOReturn txData(OSObject *owner, void *queue, void *const *pkts,
+	                       uint32_t count, void *refCon);
+};
+static_assert(!__is_abstract(RTLLlwInterface), "RTLLlwInterface must override every pure slot");
+
+/* IO80211Controller::setAwdlInterface, wrapped so the handler that creates the
+ * interface does not carry the family symbol. NULL unpublishes it. */
+IOReturn rtlAwdlPublish(IO80211Controller *ctrl, RTLAwdInterface *awdl);
+
+#endif /* RTL_AWDL_INTERFACE_H */

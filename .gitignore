@@ -20,3 +20,6 @@ __pycache__/
 /out-rtwn-ht-tx/
 /out-rtl8814au-phy/
 /out-net80211-runtime/
+
+# AirLayer build output
+/airlayer/Build/
