@@ -2932,7 +2932,13 @@ IOReturn RTWUSBController::radioTx80211Inner(const uint8_t *frame, uint32_t *len
     options.rate = data ? (radioAwdlRate_ ? radioAwdlRate_ : 6) : 4;
     options.rate_id = options.band_5ghz ? 7 : 8;
     options.firmware_rate = 0;
-    options.disable_fallback = 1;
+    /* Unicast AWDL data may fall back to slower rates on its hardware retries,
+     * as RTL8814Native's AWDL data does ("may fall back to slower rates on its
+     * retries, no lower than OFDM 6 Mb/s", RTLRadioABI.h). With fallback off
+     * every retry went at the layer's top rate and frames to a peer ~1 m away
+     * were lost (AirDrop worked only at ~10 cm, ~30 cm with a 24 Mb/s cap).
+     * Management and group frames keep a fixed rate. */
+    options.disable_fallback = (data && !multicast) ? 0 : 1;
     options.disable_queue_sequence = 1;
     if (data && radioAwdlRate_) {
         /* Per-frame TX-status request (SMPS-style tag), counted in
