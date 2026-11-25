@@ -24,7 +24,17 @@ enum RTWControlSelector {
     RTW_CONTROL_LEAVE = 3,
     RTW_CONTROL_SCAN_RESULTS = 4,
     RTW_CONTROL_CHANNEL_MAP = 5, /* additive read-only exact registered map */
-    RTW_CONTROL_SELECTOR_COUNT = 6
+    /* Experimental radio-ABI bridge (this fork only): a bench harness for the
+     * callPlatformFunction surface. Values mirror rtw/RTLRadioABI.h. Old
+     * builds reject 5 and everything above; older *drivers* keep working. */
+    RTW_CONTROL_RADIO_STATUS = 6,     /* out: RTWControlRadioStatus */
+    RTW_CONTROL_RADIO_TX_80211 = 7,   /* in: RTWControlRadioFrame */
+    RTW_CONTROL_RADIO_CHANNELS = 8,   /* out: RTWControlRadioChannels */
+    RTW_CONTROL_RADIO_SET_CHANNEL = 9, /* in: RTWControlRadioChannel */
+    RTW_CONTROL_RADIO_OFFCH = 10,      /* in: RTWControlRadioChannel (0 = BSS) */
+    RTW_CONTROL_RADIO_RATE = 11,       /* in: RTWControlRadioChannel (rate index) */
+    RTW_CONTROL_RADIO_TXSTAT = 12,     /* out: RTWControlRadioTxStat */
+    RTW_CONTROL_SELECTOR_COUNT = 13
 };
 
 enum RTWControlStatusFlags {
@@ -122,6 +132,62 @@ typedef struct RTWControlChannelMap {
     uint8_t channels[RTW_CONTROL_CHANNEL_MAP_BYTES]; /* bitN is IEEE channelN */
 } RTWControlChannelMap;
 
+/* ===== Experimental radio-ABI bridge structs (this fork only) ===== */
+typedef struct RTWControlRadioStatus {
+    uint32_t version;
+    uint32_t build;      /* bridge revision of the loaded kext (3 = gates field) */
+    uint32_t state;      /* RTL_RADIO_S_* from rtw/RTLRadioABI.h */
+    uint32_t flags;      /* bit0 data hook attached, bit1 AWDL hook attached */
+    uint32_t channel;    /* 0 if unknown */
+    uint32_t band;       /* RTL_RADIO_BAND_* */
+    uint32_t bssBw;      /* RTL_RADIO_BW_* */
+    uint32_t center;     /* center channel of the operating width */
+    int32_t  rssiDbm;    /* dBm; 0 if unavailable */
+    uint8_t  bssid[6];
+    uint8_t  ssidLength;
+    uint8_t  ssid[RTW_CONTROL_MAX_SSID];
+    /* bit0 supports88Band(5G), bit1 board known, bit2 features valid,
+     * bit3 single active RF path */
+    uint32_t gates;
+    uint32_t boardRfPaths; /* efuse-reported RF paths */
+    uint32_t reserved[2];
+} RTWControlRadioStatus;
+
+#define RTW_CONTROL_RADIO_MAX_FRAME 512U
+typedef struct RTWControlRadioFrame {
+    uint32_t version;
+    uint32_t length;     /* 24..512; bytes past length must be zero */
+    uint32_t reserved[2];
+    uint8_t  frame[RTW_CONTROL_RADIO_MAX_FRAME]; /* 802.11 header+body, no FCS */
+} RTWControlRadioFrame;
+
+typedef struct RTWControlRadioChannels {
+    uint32_t version;
+    uint32_t count;
+    uint32_t reserved[2];
+    uint8_t  channel[64];
+    uint8_t  band[64];      /* RTL_RADIO_BAND_* */
+    uint8_t  passive[64];   /* 1 = passive/DFS only */
+    uint8_t  reserved2[64];
+} RTWControlRadioChannels;
+
+typedef struct RTWControlRadioChannel {
+    uint32_t version;
+    uint32_t channel;    /* IEEE channel, or 0 for AwdlOffch=BSS, or 0=off for Rate */
+    uint32_t reserved[2];
+} RTWControlRadioChannel;
+
+typedef struct RTWControlRadioTxStat {
+    uint32_t version;
+    uint32_t clean;      /* acknowledged at the first try */
+    uint32_t retried;    /* 0: the 8821C TX-status report has no retry count */
+    uint32_t retried2;   /* 0 */
+    uint32_t lost;       /* report says not acked */
+    uint32_t rate;       /* the active AWDL rate index, 0 = fixed 12 Mb/s */
+    uint32_t reports;    /* TX-status reports seen since load */
+    uint32_t reserved;
+} RTWControlRadioTxStat;
+
 static inline int rtw_control_channel_map_contains(const RTWControlChannelMap* map,uint32_t channel) {
     return map && channel<256U && (map->channels[channel/8U]&(1U<<(channel%8U)))!=0;
 }
@@ -152,7 +218,12 @@ enum RTWControlValidation {
 
 static inline size_t rtw_control_input_size(uint32_t selector) {
     if (selector >= RTW_CONTROL_SELECTOR_COUNT) return 0;
-    return selector == RTW_CONTROL_JOIN ? sizeof(RTWControlJoin) : sizeof(RTWControlRequest);
+    if (selector == RTW_CONTROL_JOIN) return sizeof(RTWControlJoin);
+    if (selector == RTW_CONTROL_RADIO_TX_80211) return sizeof(RTWControlRadioFrame);
+    if (selector == RTW_CONTROL_RADIO_SET_CHANNEL ||
+        selector == RTW_CONTROL_RADIO_OFFCH ||
+        selector == RTW_CONTROL_RADIO_RATE) return sizeof(RTWControlRadioChannel);
+    return sizeof(RTWControlRequest);
 }
 
 /* Keep user-space connection eligibility aligned with this capability's
@@ -176,6 +247,9 @@ static inline size_t rtw_control_output_size(uint32_t selector) {
     if (selector == RTW_CONTROL_STATUS) return sizeof(RTWControlStatus);
     if (selector == RTW_CONTROL_SCAN_RESULTS) return sizeof(RTWControlScanResults);
     if (selector == RTW_CONTROL_CHANNEL_MAP) return sizeof(RTWControlChannelMap);
+    if (selector == RTW_CONTROL_RADIO_STATUS) return sizeof(RTWControlRadioStatus);
+    if (selector == RTW_CONTROL_RADIO_CHANNELS) return sizeof(RTWControlRadioChannels);
+    if (selector == RTW_CONTROL_RADIO_TXSTAT) return sizeof(RTWControlRadioTxStat);
     return sizeof(RTWControlReply);
 }
 
@@ -204,6 +278,20 @@ static inline enum RTWControlValidation rtw_control_validate_request(
                                RTW_CONTROL_MAX_SSID - length) ||
             !rtw_control_zeroes(bytes + offsetof(RTWControlJoin, reserved),
                                sizeof(((RTWControlJoin*)0)->reserved)))
+            return RTW_CONTROL_BAD_RESERVED;
+    } else if (selector == RTW_CONTROL_RADIO_SET_CHANNEL ||
+               selector == RTW_CONTROL_RADIO_OFFCH ||
+               selector == RTW_CONTROL_RADIO_RATE) {
+        if (!rtw_control_zeroes(bytes + offsetof(RTWControlRadioChannel, reserved),
+                                sizeof(((RTWControlRadioChannel*)0)->reserved)))
+            return RTW_CONTROL_BAD_RESERVED;
+    } else if (selector == RTW_CONTROL_RADIO_TX_80211) {
+        const uint32_t length = rtw_control_load32(bytes + offsetof(RTWControlRadioFrame, length));
+        if (length < 24 || length > RTW_CONTROL_RADIO_MAX_FRAME) return RTW_CONTROL_BAD_SIZE;
+        if (!rtw_control_zeroes(bytes + offsetof(RTWControlRadioFrame, reserved),
+                               sizeof(((RTWControlRadioFrame*)0)->reserved)) ||
+            !rtw_control_zeroes(bytes + offsetof(RTWControlRadioFrame, frame) + length,
+                               RTW_CONTROL_RADIO_MAX_FRAME - length))
             return RTW_CONTROL_BAD_RESERVED;
     } else if (!rtw_control_zeroes(bytes + offsetof(RTWControlRequest, reserved),
                                    sizeof(((RTWControlRequest*)0)->reserved))) {
@@ -237,6 +325,15 @@ RTW_CONTROL_ASSERT(offsetof(RTWControlScanResults, records) == 24, "scan records
 RTW_CONTROL_ASSERT(sizeof(RTWControlChannelMap) == 48, "channel map ABI size");
 RTW_CONTROL_ASSERT(RTW_CONTROL_ALIGNOF(RTWControlChannelMap) == 4, "channel map ABI alignment");
 RTW_CONTROL_ASSERT(offsetof(RTWControlChannelMap, channels) == 16, "channel bitmap ABI offset");
+RTW_CONTROL_ASSERT(sizeof(RTWControlRadioStatus) == 92, "radio status ABI size");
+RTW_CONTROL_ASSERT(RTW_CONTROL_ALIGNOF(RTWControlRadioStatus) == 4, "radio status ABI alignment");
+RTW_CONTROL_ASSERT(sizeof(RTWControlRadioFrame) == 528, "radio frame ABI size");
+RTW_CONTROL_ASSERT(RTW_CONTROL_ALIGNOF(RTWControlRadioFrame) == 4, "radio frame ABI alignment");
+RTW_CONTROL_ASSERT(offsetof(RTWControlRadioFrame, frame) == 16, "radio frame ABI offset");
+RTW_CONTROL_ASSERT(sizeof(RTWControlRadioChannels) == 272, "radio channels ABI size");
+RTW_CONTROL_ASSERT(RTW_CONTROL_ALIGNOF(RTWControlRadioChannels) == 4, "radio channels ABI alignment");
+RTW_CONTROL_ASSERT(sizeof(RTWControlRadioChannel) == 16, "radio channel ABI size");
+RTW_CONTROL_ASSERT(sizeof(RTWControlRadioTxStat) == 32, "radio txstat ABI size");
 #undef RTW_CONTROL_ASSERT
 #undef RTW_CONTROL_ALIGNOF
 

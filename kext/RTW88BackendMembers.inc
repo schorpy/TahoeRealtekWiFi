@@ -32,6 +32,11 @@
     void *r88Storage_=nullptr;
     bool r88BoardKnown_=false,r88Media_=false,r88RateReady_=false,r88RSSIValid_=false;
     uint8_t r88MACAddress_[6]{},r88Channel_=0,r88RSSI_=0;
+    /* r88MACAddress_ is the efuse identity bootstrap88(true) re-verifies on
+     * every start; rtlRadioSetMac must not overwrite it (private MAC ->
+     * ENODEV -> latched core_error). The on-air station address lives here. */
+    uint8_t r88StationMAC_[6]{};bool r88StationMACSet_=false;
+    const uint8_t *station88MAC() const { return r88StationMACSet_?r88StationMAC_:r88MACAddress_; }
     uint16_t r88PacketSequence_=0;
     rtw88_coex *r88Coex_=nullptr;
     IOTimerEventSource *r88CoexTimer_=nullptr;

@@ -97,6 +97,23 @@ bool RTWUSBController::configureInterface(IONetworkInterface *interface) {
 IOReturn RTWUSBController::getHardwareAddress(IOEthernetAddress *address) {
     if (!address) return kIOReturnBadArgument;
     if (!macReady_) return kIOReturnNotReady;
+    /* rtlair>=2: the dummy MAC MUST STAY on this raw ifnet. Without it the
+     * InterfaceNamer collision (this ifnet and the layer's interface both
+     * carry the radio MAC at birth — the layer's randomized MAC is only
+     * applied at join time) leaves the layer's interface UNNAMED -> the
+     * port falls back to Ethernet -> airportd never adopts -> no toggle
+     * (boot 16 proved the revert regresses this).
+     * COST (accepted): the APP's path rides this ifnet; the hotspot's lease
+     * filter drops the never-leased dummy MAC -> the app connects but gets
+     * 169.254. The NATIVE path is unaffected: its DHCP identity = the
+     * layer's interface MAC, which rtlRadioSetMac applies to the radio
+     * itself — consistent over the air. */
+    uint32_t rtlair = 0;
+    if (PE_parse_boot_argn("rtlair", &rtlair, sizeof(rtlair)) && rtlair >= 2) {
+        static const uint8_t dummy[6] = {0x02, 0x00, 0x54, 0x52, 0x57, 0x00};
+        memcpy(address->bytes, dummy, sizeof(dummy));
+        return kIOReturnSuccess;
+    }
     *address = mac_; return kIOReturnSuccess;
 }
 void RTWUSBController::fault(IOReturn error) {
@@ -335,6 +352,12 @@ int RTWUSBController::scanComplete(ieee80211com*ic) {
     s->scanDiag_.state=rtw::ScanDiagnosticState::Complete;
     s->scanDiag_.lastError=0;
     s->publishScanDiagnostics();
+    /* Radio ABI: a scan that ended idle returns the radio to its parked
+     * channel (rtlRadioSetChannel semantics). Best effort; the next sweep
+     * re-parks anyway. */
+    if(s->radioIdleChannel_&&ic->ic_state==IEEE80211_S_SCAN&&
+       s->permits88Channel((uint8_t)s->radioIdleChannel_)&&!s->radioOffchState_)
+        (void)s->set88Channel((uint8_t)s->radioIdleChannel_,false);
     return 1;
 }
 
@@ -1233,6 +1256,22 @@ void RTWUSBController::receive(const uint8_t*bytes,size_t length) {
         const auto&p=frame.payload;
         if(reportType){++rxDiag_.c2h;if(reportType==7)handle8723C2H(p.mpdu,p.mpdu_length);else if(reportType==6)handle88C2H(p.mpdu,p.mpdu_length);else if(reportType==5){if(is8192FUFamily())handle8192FUC2H(p.mpdu,p.mpdu_length);else if(is8710BUFamily())handle8710BUC2H(p.mpdu,p.mpdu_length);else handle8812C2H(p.mpdu,p.mpdu_length);}else if(reportType==4)handle8814C2H(p.mpdu,p.mpdu_length);else if(reportType==1)handleTxReport(p.mpdu,p.mpdu_length);continue;}
         uint64_t*drop=nullptr;
+        /* RTL radio ABI: while the AWDL hook is attached, every received
+         * 802.11 frame whose A3 is the AWDL BSSID goes to the hook as raw
+         * bytes (header included, FCS stripped, rssi + current channel) and
+         * is dropped here afterwards. NOTE hardware coverage: whether the
+         * chip's RX filter lets foreign-BSSID frames reach USB at all is
+         * unverified on 8821C silicon; the software tap below is complete
+         * either way, the awdlsim test port does not depend on it. */
+        if(radioAwdlHook_&&p.mpdu&&p.mpdu_length>=24&&(p.mpdu[0]&IEEE80211_FC0_TYPE_MASK)!=IEEE80211_FC0_TYPE_CTL){
+            static const uint8_t awdlBSSID[6]={0x00,0x25,0x00,0xff,0x94,0x73};
+            if(!memcmp(p.mpdu+16,awdlBSSID,6)){
+                rtw88_rx_phy_sample sample{};int8_t rssi=0;
+                if(rtw88_rx_parse_phy(&r88RX_,&p,&sample))rssi=(int8_t)sample.signal_dbm;
+                radioAwdlHook_(radioAwdlHookCtx_,p.mpdu,p.mpdu_length,rssi,r88Channel_);
+                continue;
+            }
+        }
         const bool authorizedHT=authorized()&&(usesFirmwareRate()||usesLegacyHighThroughput()||(uses8814FirmwareRate()&&acRateConfig_.ht)||uses88HighThroughput()||uses8812HighThroughput()||uses8192FUHighThroughput()||uses8710BUHighThroughput()||(uses8723FirmwareRate()&&(r23Rates_.mask&0xff000U))||(uses8192DUFirmwareRate()&&duMAC_.rates.ht));
         const uint8_t*peer=core_.sc_ic.ic_bss?core_.sc_ic.ic_bss->ni_bssid:nullptr;
         rtw_rx_admission_reason admissionReason=RTW_RX_REJECT_RATE;
@@ -1928,6 +1967,62 @@ IOReturn RTWUSBController::handleControl(ControlCall*call) {
     if(call->selector==RTW_CONTROL_STATUS){status(static_cast<RTWControlStatus*>(call->output));return kIOReturnSuccess;}
     if(call->selector==RTW_CONTROL_SCAN_RESULTS){scanResults(static_cast<RTWControlScanResults*>(call->output));return kIOReturnSuccess;}
     if(call->selector==RTW_CONTROL_CHANNEL_MAP){channelMap(static_cast<RTWControlChannelMap*>(call->output));return kIOReturnSuccess;}
+    /* Experimental radio-ABI bridge: bench access to the callPlatformFunction
+     * surface before any layer kext exists. Status/channels are read-only; TX
+     * carries the radio-side guards (NotReady/Busy/NoResources) verbatim. */
+    if(call->selector==RTW_CONTROL_RADIO_STATUS){
+        auto*out=static_cast<RTWControlRadioStatus*>(call->output);
+        struct rtl_radio_status radio{};
+        radioStatus(&radio);
+        out->version=RTW_CONTROL_VERSION;out->build=3;out->state=radio.state;
+        out->flags=(radioDataHook_?1U:0U)|(radioAwdlHook_?2U:0U);
+        out->channel=radio.channel;out->band=radio.band;out->bssBw=radio.bss_bw;out->center=radio.center;
+        out->rssiDbm=radio.rssi_dbm;memcpy(out->bssid,radio.bssid,6);
+        out->ssidLength=radio.ssid_len;memcpy(out->ssid,radio.ssid,radio.ssid_len);
+        out->gates=(supports88Band(true)?1U:0U)|(r88BoardKnown_?2U:0U)|
+            (r88Core_.board.features_valid?4U:0U)|(r88Core_.board.active_rf_paths==1?8U:0U);
+        out->boardRfPaths=r88Core_.board.rf_paths;
+        out->reserved[0]=(uint32_t)radioOffchLastErr_;
+        out->reserved[1]=radioOffchLastStep_;
+        return kIOReturnSuccess;
+    }
+    if(call->selector==RTW_CONTROL_RADIO_TX_80211){
+        const auto*frame=static_cast<const RTWControlRadioFrame*>(call->input);
+        uint32_t length=frame->length;
+        return radioTx80211(frame->frame,&length);
+    }
+    if(call->selector==RTW_CONTROL_RADIO_CHANNELS){
+        auto*out=static_cast<RTWControlRadioChannels*>(call->output);
+        struct rtl_radio_chan plan[64]{};
+        uint32_t count=64;
+        radioChannels(plan,&count);
+        out->version=RTW_CONTROL_VERSION;out->count=count;
+        for(uint32_t i=0;i<count;++i){out->channel[i]=plan[i].channel;out->band[i]=plan[i].band;out->passive[i]=plan[i].passive;}
+        return kIOReturnSuccess;
+    }
+    if(call->selector==RTW_CONTROL_RADIO_SET_CHANNEL){
+        const auto*in=static_cast<const RTWControlRadioChannel*>(call->input);
+        uint32_t channel=in->channel;
+        return radioSetChannel(&channel);
+    }
+    if(call->selector==RTW_CONTROL_RADIO_OFFCH){
+        const auto*in=static_cast<const RTWControlRadioChannel*>(call->input);
+        uint32_t channel=in->channel;
+        return radioAwdlOffch(&channel);
+    }
+    if(call->selector==RTW_CONTROL_RADIO_RATE){
+        const auto*in=static_cast<const RTWControlRadioChannel*>(call->input);
+        uint32_t rate=in->channel;
+        return radioAwdlRate(&rate);
+    }
+    if(call->selector==RTW_CONTROL_RADIO_TXSTAT){
+        auto*out=static_cast<RTWControlRadioTxStat*>(call->output);
+        struct rtl_radio_awdl_txstat stat{};
+        const IOReturn result=radioAwdlTxStat(&stat);
+        out->version=RTW_CONTROL_VERSION;out->clean=stat.clean;out->retried=stat.retried;
+        out->retried2=stat.retried2;out->lost=stat.lost;out->rate=stat.rate;out->reports=stat.reports;
+        return result;
+    }
     auto*reply=static_cast<RTWControlReply*>(call->output);reply->version=RTW_CONTROL_VERSION;
     if(call->selector==RTW_CONTROL_LEAVE){
         userRadioDisabled_=true;
@@ -2006,9 +2101,17 @@ IOReturn RTWUSBController::gated(OSObject*object,void*operation,void*a,void*,voi
             // completion path services that queue after inner capacity opens.
             call->consumed=false;return kIOReturnOutputStall;
         }
+        /* AWDL off-channel slot: the radio is elsewhere, so hold the data
+         * queues (ABI rule) instead of letting send88Frame drop them. */
+        if(s->radioOffchState_)return kIOReturnOutputSuccess;
         rtwn_start(&s->core_.sc_ic.ic_if);return kIOReturnOutputSuccess;
     }
     case Control:return s->handleControl(static_cast<ControlCall*>(a));
+    case RadioABI:{
+        auto*call=static_cast<RadioABICall*>(a);
+        s->radioABIEntry(call);
+        return call->result;
+    }
     case Terminated:
         // Reject new work before quiescing; stop() may follow synchronously
         // when our provider is closed by the termination notification.
@@ -2140,6 +2243,12 @@ bool RTWUSBController::start(IOService*provider) {
     bool mediumOK=media&&automatic&&IONetworkMedium::addMedium(media,automatic)&&publishMediumDictionary(media)&&setSelectedMedium(automatic);
     if(automatic)automatic->release();if(media)media->release();
     IONetworkInterface*interface=nullptr;
+    /* NOTE (reverted): skipping the ifnet when rtlair=2 broke the driver's
+     * own scan/join machinery (ieee80211_begin_scan needs the attached,
+     * UP ifnet; without it neither the custom app nor the ABI scans
+     * return results). The competing-ifnet theory is dead: DrogaBox's
+     * working setup has BOTH ifnets (driver en2 + the native one) on
+     * 26.7. The ifnet-materialization blocker must be found elsewhere. */
     if(!mediumOK||!attachInterface(&interface,false)){stopPowerManagement();reportStartStage("ethernet-attach",kIOReturnError);gate_->runAction(gated,(void*)Shutdown);releasePlatform();super::stop(provider);markTeardownReady();return false;}
     netif_=OSDynamicCast(IOEthernetInterface,interface);
     if(!netif_){stopPowerManagement();reportStartStage("ethernet-type",kIOReturnUnsupported);detachInterface(interface,true);interface->release();gate_->runAction(gated,(void*)Shutdown);releasePlatform();super::stop(provider);markTeardownReady();return false;}
@@ -2241,4 +2350,691 @@ void RTWUSBController::deferredCleanup(thread_call_param_t argument,thread_call_
     gate->release();lease->release();
     controller->releasePlatform();
     controller->release(); // Balance shutdownPlatform's deferred retain exactly once.
+}
+
+/* ===================== RTL radio ABI =====================
+ * Surface for an external IO80211 layer kext (DrogaBox's RTLAirLayer or a
+ * port of it): it adopts the radio through callPlatformFunction with the
+ * rtlRadio* symbols of include/rtw/RTLRadioABI.h. Every entry runs on the
+ * controller's command gate so it serializes with USB I/O and net80211.
+ * Milestone 1 implements the infra ops. The AWDL ops still answer
+ * kIOReturnUnsupported; they need per-chip TX-report/ad-hoc-port/off-channel
+ * work in the RTW88 backend (see docs plan). */
+static RTWUSBController *rtwRadioABIOwner = nullptr;
+
+extern "C" int rtw_radio_rx_hook_active(void) {
+    RTWUSBController *s = rtwRadioABIOwner;
+    return s && s->radioHookActive() ? 1 : 0;
+}
+
+extern "C" int rtw_radio_rx_hook_deliver(void *mbuf) {
+    RTWUSBController *s = rtwRadioABIOwner;
+    rtl_radio_rx_fn hook = nullptr;
+    void *ctx = nullptr;
+    if (s) {
+        /* Read under the completion path's serialization: receive() runs on
+         * the driver's completion context, so the member pair is stable. */
+        hook = s->radioHookFn();
+        ctx = s->radioHookCtx();
+    }
+    if (!hook) return 0;
+    hook(ctx, mbuf);            /* the hook now owns the mbuf */
+    return 1;
+}
+
+bool RTWUSBController::radioABIAdmits() const {
+    /* Only dual-band station backends: AWDL lives on the 5 GHz social
+     * channels, so a 2.4-only adapter must not be adopted by the layer. */
+    return profile_ != nullptr &&
+        (is88Family() || is8812Family() || family_ == RTW_WIFI_RTL8814AU);
+}
+
+IOReturn RTWUSBController::dispatchRadioABI(const char *fn, void *p1, void *p2) {
+    if (!fn) return kIOReturnBadArgument;
+    RadioABICall call{fn, p1, p2, kIOReturnNotReady};
+    IOWorkLoop *lease = nullptr;
+    IOCommandGate *gate = copyGate(&lease);
+    if (!gate) return kIOReturnNotReady;
+    IOReturn result = gate->runAction(gated, (void *)RadioABI, &call);
+    gate->release();
+    lease->release();
+    return result == kIOReturnSuccess ? call.result : result;
+}
+
+IOReturn RTWUSBController::callPlatformFunction(const OSSymbol *functionName, bool waitForFunction,
+                                                void *p1, void *p2, void *p3, void *p4) {
+    const char *fn = functionName ? functionName->getCStringNoCopy() : nullptr;
+    if (fn && strncmp(fn, "rtlRadio", 8) == 0)
+        return dispatchRadioABI(fn, p1, p2);
+    return super::callPlatformFunction(functionName, waitForFunction, p1, p2, p3, p4);
+}
+
+IOReturn RTWUSBController::callPlatformFunction(const char *functionName, bool waitForFunction,
+                                                void *p1, void *p2, void *p3, void *p4) {
+    if (functionName && strncmp(functionName, "rtlRadio", 8) == 0)
+        return dispatchRadioABI(functionName, p1, p2);
+    return super::callPlatformFunction(functionName, waitForFunction, p1, p2, p3, p4);
+}
+
+void RTWUSBController::radioABIEntry(RadioABICall *call) {
+    call->result = kIOReturnUnsupported;
+    if (!call->fn || !radioABIAdmits()) return;
+    const char *fn = call->fn;
+    void *p1 = call->p1, *p2 = call->p2;
+    auto&ic = core_.sc_ic;
+    if (strcmp(fn, RTL_RADIO_FN_ABI) == 0) {
+        if (!p1) { call->result = kIOReturnBadArgument; return; }
+        *(uint32_t *)p1 = RTL_RADIO_ABI;
+        call->result = kIOReturnSuccess;
+        return;
+    }
+    if (strcmp(fn, RTL_RADIO_FN_MAC) == 0) {
+        if (!p1) { call->result = kIOReturnBadArgument; return; }
+        memcpy(p1, mac_.bytes, 6);
+        call->result = kIOReturnSuccess;
+        return;
+    }
+    if (strcmp(fn, RTL_RADIO_FN_SET_MAC) == 0) {
+        if (!p1) { call->result = kIOReturnBadArgument; return; }
+        /* DrogaBox builds 4.15+ accept it. REQUIRED for the native UI: the
+         * layer's interface carries macOS's (randomized) identity and the
+         * radio must match it over the air. With this stubbed, the
+         * association stayed on the efuse MAC while the DHCP client was the
+         * interface's MAC — every hotspot's lease filter drops that
+         * mismatch (boots 9-13: DHCP DISCOVER left, no OFFER, 169.254).
+         * Update all three identities together: the firmware's station
+         * entry (r88StationMAC_ + a re-apply; r88MACAddress_ stays the efuse
+         * identity that start88's bootstrap re-verifies), net80211's TX/RX identity
+         * (ic_myaddr), and the ABI readback (mac_). The driver's raw ifnet
+         * keeps its locally-administered MAC (getHardwareAddress), so the
+         * InterfaceNamer collision stays fixed. */
+        const uint8_t *newMac = static_cast<const uint8_t *>(p1);
+        memcpy(r88StationMAC_, newMac, 6);
+        r88StationMACSet_ = true;
+        memcpy(core_.sc_ic.ic_myaddr, newMac, 6);
+        memcpy(mac_.bytes, newMac, 6);
+        if (attached_ && present_ && core_.sc_ic.ic_state != IEEE80211_S_INIT)
+            call->result = fromErrno(station88Hardware(core_.sc_ic.ic_state));
+        else
+            call->result = kIOReturnSuccess;
+        return;
+    }
+    if (strcmp(fn, RTL_RADIO_FN_STATUS) == 0) {
+        if (!p1) { call->result = kIOReturnBadArgument; return; }
+        radioStatus(static_cast<struct rtl_radio_status *>(p1));
+        call->result = kIOReturnSuccess;
+        return;
+    }
+    if (strcmp(fn, RTL_RADIO_FN_CHANNELS) == 0) {
+        if (!p1 || !p2) { call->result = kIOReturnBadArgument; return; }
+        radioChannels(static_cast<struct rtl_radio_chan *>(p1),
+                      static_cast<uint32_t *>(p2));
+        call->result = kIOReturnSuccess;
+        return;
+    }
+    if (strcmp(fn, RTL_RADIO_FN_SCAN_START) == 0) {
+        call->result = radioScanStart(static_cast<const uint32_t *>(p1),
+                                      static_cast<const uint32_t *>(p2));
+        return;
+    }
+    if (strcmp(fn, RTL_RADIO_FN_SCAN_COPY) == 0) {
+        if (!p1 || !p2) { call->result = kIOReturnBadArgument; return; }
+        radioScanCopy(static_cast<struct rtl_radio_bss *>(p1),
+                      static_cast<uint32_t *>(p2));
+        call->result = kIOReturnSuccess;
+        return;
+    }
+    if (strcmp(fn, RTL_RADIO_FN_JOIN) == 0) {
+        if (!p1) { call->result = kIOReturnBadArgument; return; }
+        call->result = radioJoin(static_cast<struct rtl_radio_join *>(p1));
+        return;
+    }
+    if (strcmp(fn, RTL_RADIO_FN_LEAVE) == 0) {
+        call->result = radioLeave();
+        return;
+    }
+    if (strcmp(fn, RTL_RADIO_FN_DATA_HOOK) == 0) {
+        call->result = radioDataHook(reinterpret_cast<rtl_radio_rx_fn>(p1), p2);
+        return;
+    }
+    if (strcmp(fn, RTL_RADIO_FN_TX) == 0) {
+        call->result = radioTx(static_cast<mbuf_t>(p1));
+        return;
+    }
+    if (strcmp(fn, RTL_RADIO_FN_AWDL_HOOK) == 0) {
+        /* Raw AWDL-BSSID RX hook; frames are tapped in receive() before the
+         * BSS admission filters. Hardware RX-filter coverage is a hardware
+         * question (see the caveat in the tap comment). */
+        radioAwdlHook_ = reinterpret_cast<rtl_radio_awdl_rx_fn>(p1);
+        radioAwdlHookCtx_ = p1 ? p2 : nullptr;
+        call->result = kIOReturnSuccess;
+        return;
+    }
+    if (strcmp(fn, RTL_RADIO_FN_TX_80211) == 0) {
+        call->result = radioTx80211(static_cast<const uint8_t *>(p1),
+                                    static_cast<uint32_t *>(p2));
+        return;
+    }
+    if (strcmp(fn, RTL_RADIO_FN_SET_CHANNEL) == 0) {
+        call->result = radioSetChannel(static_cast<const uint32_t *>(p1));
+        return;
+    }
+    if (strcmp(fn, RTL_RADIO_FN_AWDL_OFFCH) == 0) {
+        call->result = radioAwdlOffch(static_cast<const uint32_t *>(p1));
+        return;
+    }
+    if (strcmp(fn, RTL_RADIO_FN_AWDL_RATE) == 0) {
+        call->result = radioAwdlRate(static_cast<const uint32_t *>(p1));
+        return;
+    }
+    if (strcmp(fn, RTL_RADIO_FN_AWDL_TXSTAT) == 0) {
+        if (!p1) { call->result = kIOReturnBadArgument; return; }
+        call->result = radioAwdlTxStat(static_cast<struct rtl_radio_awdl_txstat *>(p1));
+        return;
+    }
+    if (strcmp(fn, RTL_RADIO_FN_AWDL_PORT) == 0 ||
+        strcmp(fn, RTL_RADIO_FN_AWDL_RATE) == 0 ||
+        strcmp(fn, RTL_RADIO_FN_AWDL_TXSTAT) == 0 ||
+        strcmp(fn, RTL_RADIO_FN_SET_CHANNEL) == 0 ||
+        strcmp(fn, RTL_RADIO_FN_AWDL_OFFCH) == 0 ||
+        strcmp(fn, RTL_RADIO_FN_AWDL_AGG) == 0) {
+        /* Milestone 4: AwdlPort needs a second MACID/ad-hoc port in the
+         * rtw88 station firmware API; AwdlAgg needs host-driven BA agreements.
+         * Without the port, unicast AWDL TX still works but without HW ACKs. */
+        call->result = kIOReturnUnsupported;
+        return;
+    }
+}
+
+void RTWUSBController::radioStatus(struct rtl_radio_status *out) {
+    bzero(out, sizeof(*out));
+    auto&ic = core_.sc_ic;
+    switch (ic.ic_state) {
+    case IEEE80211_S_INIT: out->state = RTL_RADIO_S_IDLE; break;
+    case IEEE80211_S_SCAN: out->state = RTL_RADIO_S_SCAN; break;
+    case IEEE80211_S_AUTH: case IEEE80211_S_ASSOC:
+        out->state = RTL_RADIO_S_JOINING; break;
+    case IEEE80211_S_RUN: out->state = RTL_RADIO_S_LINKED; break;
+    default: break;
+    }
+    out->hook_attached = radioDataHook_ != nullptr;
+    out->scanning = ic.ic_state == IEEE80211_S_SCAN ? 1 : 0;
+    if (!ic.ic_bss) return;
+    auto *n = ic.ic_bss;
+    out->port_valid = n->ni_port_valid;
+    out->rsn = (ic.ic_flags & IEEE80211_F_RSNON) != 0;
+    memcpy(out->bssid, n->ni_bssid, 6);
+    out->ssid_len = n->ni_esslen <= 32 ? n->ni_esslen : 0;
+    memcpy(out->ssid, n->ni_essid, out->ssid_len);
+    if (n->ni_chan && n->ni_chan != IEEE80211_CHAN_ANYC) {
+        const uint32_t flags = n->ni_chan->ic_flags;
+        out->channel = (uint8_t)ieee80211_chan2ieee(&ic, n->ni_chan);
+        out->band = out->channel <= 14 ? RTL_RADIO_BAND_2G : RTL_RADIO_BAND_5G;
+        if (flags & IEEE80211_CHAN_VHT80) out->bss_bw = RTL_RADIO_BW_80;
+        else if (flags & IEEE80211_CHAN_HT40) out->bss_bw = RTL_RADIO_BW_40;
+        else out->bss_bw = RTL_RADIO_BW_20;
+        out->center = out->channel;     /* primary-centered approximation */
+    }
+    if (ic.ic_state == IEEE80211_S_RUN) {
+        const uint64_t now = nowMS();
+        out->rssi_dbm = rtw_signal_value(&signal_, n->ni_bssid, out->channel, now);
+        out->nss = 1;                   /* RTL8821CU: single spatial stream */
+    }
+}
+
+void RTWUSBController::radioChannels(struct rtl_radio_chan *out, uint32_t *count) {
+    const uint32_t capacity = count ? *count : 0;
+    uint32_t filled = 0;
+    auto&ic = core_.sc_ic;
+    for (uint16_t channel = 1; channel <= 165 && filled < capacity; ++channel) {
+        if (channel > 14 && channel < 36) { channel = 35; continue; }
+        if (channel > 64 && channel < 100) { channel = 99; continue; }
+        if (channel > 116 && channel < 132) { channel = 131; continue; }
+        if (channel > 140 && channel < 149) { channel = 148; continue; }
+        const auto *ch = &ic.ic_channels[channel];
+        if (!(ch->ic_flags & (IEEE80211_CHAN_2GHZ | IEEE80211_CHAN_5GHZ)))
+            continue;
+        out[filled].channel = (uint8_t)channel;
+        out[filled].band = channel <= 14 ? RTL_RADIO_BAND_2G : RTL_RADIO_BAND_5G;
+        out[filled].passive = (ch->ic_flags & (IEEE80211_CHAN_PASSIVE | IEEE80211_CHAN_DFS)) != 0;
+        out[filled].reserved = 0;
+        ++filled;
+    }
+    if (count) *count = filled;
+}
+
+IOReturn RTWUSBController::radioScanStart(const uint32_t *channels, const uint32_t *count) {
+    if (!attached_ || !present_ || sleeping_ || usbError_ != kIOReturnSuccess)
+        return kIOReturnNotReady;
+    if (rxRecovery_.pending) return kIOReturnBusy;
+    /* The ABI's restricted channel list is a milestone-2 refinement; a full
+     * plan scan is always legal per the ABI (restricted lists only narrow it). */
+    (void)channels; (void)count;
+    userRadioDisabled_ = false;
+    if (!running_) return enableStation();
+    /* S_RUN = associated and online: scans are legal (net80211 hops back to
+     * the home channel per channel) — wedging them froze the native UI
+     * (airportd's background scans all returned kIOReturnBusy).
+     * But S_AUTH/S_ASSOC = the handshake in flight: a scan landing there
+     * CANCELS the join and bounces the radio back to SCAN forever (the
+     * auth/scan ping-pong — boot 11's "cannot connect"). Block scans during
+     * the handshake exactly, let them through once RUN. */
+    if (core_.sc_ic.ic_state >= IEEE80211_S_AUTH && core_.sc_ic.ic_state < IEEE80211_S_RUN)
+        return kIOReturnBusy;
+    /* S_RUN: do NOT begin a net80211 scan. ieee80211_begin_scan() runs
+     * ieee80211_node_cleanup(ic_bss) (keys/port gone) and leaves RUN, so the
+     * layer sees !LINKED and drops the link (efi-tahoe 2026-11-25: link_on,
+     * airportd's post-join scan ~0.3 s later, link_off ~0.5 s after that,
+     * every join). Accept the request instead: the layer's linked-scan path
+     * waits ~2.5 s and then serves rtlRadioScanCopy from the node table,
+     * which still holds the earlier scan results. Busy is no option (it
+     * froze the native UI, see above). */
+    if (core_.sc_ic.ic_state == IEEE80211_S_RUN)
+        return kIOReturnSuccess;
+    ieee80211_begin_scan(&core_.sc_ic.ic_if);
+    return rtwn_io_error(&core_) ? kIOReturnIOError : kIOReturnSuccess;
+}
+
+void RTWUSBController::radioScanCopy(struct rtl_radio_bss *out, uint32_t *count) {
+    const uint32_t capacity = count ? *count : 0;
+    uint32_t filled = 0;
+    auto&ic = core_.sc_ic;
+    struct ieee80211_node *node = RB_MIN(ieee80211_tree, &ic.ic_tree);
+    while (node && filled < capacity) {
+        if (node->ni_esslen <= 32 && node->ni_chan && node->ni_chan != IEEE80211_CHAN_ANYC) {
+            auto *r = &out[filled];
+            bzero(r, sizeof(*r));
+            memcpy(r->bssid, node->ni_bssid, 6);
+            r->ssid_len = node->ni_esslen;
+            memcpy(r->ssid, node->ni_essid, r->ssid_len);
+            r->channel = (uint8_t)ieee80211_chan2ieee(&ic, node->ni_chan);
+            r->band = r->channel <= 14 ? RTL_RADIO_BAND_2G : RTL_RADIO_BAND_5G;
+            if (node->ni_rsnprotos & IEEE80211_PROTO_RSN) {
+                r->security = (node->ni_rsnakms & IEEE80211_AKM_PSK) &&
+                              (node->ni_rsnciphers & IEEE80211_CIPHER_CCMP) ? 3 : 2;
+            }
+            r->rssi_dbm = node->ni_rssi ? (int16_t)node->ni_rssi - 100 : 0;
+            r->capinfo = node->ni_capinfo;
+            r->intval = node->ni_intval;
+            if (node->ni_rsnie && node->ni_rsnie[1] >= 1) {
+                const uint16_t len = (uint16_t)(2 + node->ni_rsnie[1]);
+                r->ies_len = len <= RTL_RADIO_MAX_IES ? len : RTL_RADIO_MAX_IES;
+                memcpy(r->ies, node->ni_rsnie, r->ies_len);
+            }
+            ++filled;
+        }
+        node = RB_NEXT(ieee80211_tree, &ic.ic_tree, node);
+    }
+    if (count) *count = filled;
+}
+
+IOReturn RTWUSBController::radioJoin(struct rtl_radio_join *join) {
+    if (!join || !join->ssid_len || join->ssid_len > 32)
+        return kIOReturnBadArgument;
+    if (join->is_sae) {
+        /* The RTW88 backend joins WPA2-PSK/CCMP only (net80211 RSN). Wipe the
+         * password the ABI promised to consume, then refuse. */
+        bzero(join->sae_password, sizeof(join->sae_password));
+        return kIOReturnUnsupported;
+    }
+    if (!attached_ || !present_ || sleeping_ || usbError_ != kIOReturnSuccess)
+        return kIOReturnNotReady;
+    userRadioDisabled_ = false;
+    quiesce(true);
+    if (join->has_pmk) {
+        ieee80211_wpaparams parameters{};
+        parameters.i_enabled = 1;
+        parameters.i_protos = IEEE80211_WPA_PROTO_WPA2;
+        parameters.i_akms = IEEE80211_WPA_AKM_PSK;
+        parameters.i_ciphers = IEEE80211_WPA_CIPHER_CCMP;
+        parameters.i_groupcipher = IEEE80211_WPA_CIPHER_CCMP;
+        int error = ieee80211_ioctl_setwpaparms(&core_.sc_ic, &parameters);
+        if (error && error != ENETRESET) return fromErrno(error);
+        memcpy(core_.sc_ic.ic_psk, join->pmk, 32);
+        core_.sc_ic.ic_flags |= IEEE80211_F_PSK;
+    } else {
+        core_.sc_ic.ic_flags &= ~IEEE80211_F_PSK;
+    }
+    core_.sc_ic.ic_des_esslen = join->ssid_len;
+    memcpy(core_.sc_ic.ic_des_essid, join->ssid, join->ssid_len);
+    joinRequested_ = true;
+    IOReturn result = enableStation();
+    if (result != kIOReturnSuccess) quiesce(true);
+    return result;
+}
+
+IOReturn RTWUSBController::radioLeave() {
+    userRadioDisabled_ = true;
+    if (sleeping_) eraseProfile();
+    else quiesce(true);
+    return kIOReturnSuccess;
+}
+
+IOReturn RTWUSBController::radioDataHook(rtl_radio_rx_fn hook, void *ctx) {
+    if (hook && radioDataHook_) return kIOReturnBusy;
+    rtl_radio_rx_fn previous = radioDataHook_;
+    radioDataHook_ = hook;
+    radioDataHookCtx_ = hook ? ctx : nullptr;
+    /* Owner pointer for the net80211 glue; cleared when the last hook leaves. */
+    rtwRadioABIOwner = hook ? this :
+        (rtwRadioABIOwner == this ? nullptr : rtwRadioABIOwner);
+    (void)previous;
+    radioLinkRefresh();
+    return kIOReturnSuccess;
+}
+
+IOReturn RTWUSBController::radioTx(mbuf_t packet) {
+    if (!packet) return kIOReturnBadArgument;
+    if (stopping_ || !authorized()) { mbuf_freem(packet); return kIOReturnOutputDropped; }
+    auto *queue = core_.sc_ic.ic_if.if_snd.queue;
+    if (!queue) { mbuf_freem(packet); return kIOReturnOutputDropped; }
+    if (!queue->lockEnqueue(packet)) {
+        /* ABI consumers retry; keep the frame with the caller on stall. */
+        return kIOReturnBusy;
+    }
+    rtwn_start(&core_.sc_ic.ic_if);
+    return kIOReturnSuccess;
+}
+
+void RTWUSBController::radioLinkRefresh() {
+    /* ABI rule: while the data hook owns RX, en2 reports its link inactive so
+     * macOS does not route traffic through it behind the layer's back. */
+    if (!netif_) return;
+    if (radioDataHook_)
+        setLinkStatus(kIONetworkLinkValid);
+    else if (authorized())
+        setLinkStatus(kIONetworkLinkValid | kIONetworkLinkActive);
+    else
+        setLinkStatus(kIONetworkLinkValid);
+}
+
+IOReturn RTWUSBController::radioTx80211(const uint8_t *frame, uint32_t *len) {
+    /* ABI: one management frame, or one AWDL data frame (data or QoS data,
+     * To/From DS 0, A3 = the AWDL BSSID), header and body, no FCS, on the
+     * current operating channel. The radio supplies the sequence number. */
+    if (!frame || !len) return kIOReturnBadArgument;
+    const uint32_t length = *len;
+    if (length < sizeof(ieee80211_frame) || length > 4096)
+        return kIOReturnBadArgument;
+    static const uint8_t awdlBSSID[6] = {0x00, 0x25, 0x00, 0xff, 0x94, 0x73};
+    const uint8_t type = frame[0] & IEEE80211_FC0_TYPE_MASK;
+    const uint8_t direction = frame[1] & IEEE80211_FC1_DIR_MASK;
+    const bool data = type == IEEE80211_FC0_TYPE_DATA;
+    const bool qos = data && (frame[0] & IEEE80211_FC0_SUBTYPE_QOS) != 0;
+    if (type == IEEE80211_FC0_TYPE_CTL) return kIOReturnBadArgument;
+    if (data && (direction != IEEE80211_FC1_DIR_NODS ||
+                 memcmp(frame + 16, awdlBSSID, 6)))
+        return kIOReturnBadArgument;
+    if (qos && length < sizeof(ieee80211_frame) + 2)
+        return kIOReturnBadArgument;
+    if (core_.core_error || !running_ || stopping_ || !present_ || sleeping_ ||
+        usbError_ != kIOReturnSuccess || r88Core_.firmware.last_error ||
+        !r88Station_.initialized)
+        return kIOReturnNotReady;
+    if (r88RadioState(this, r88Channel_) != 2) return kIOReturnBusy;
+
+    unsigned index = RTW_TRANSFER_SLOTS;
+    IOInterruptState lock = IOSimpleLockLockDisableInterrupt(completionLock_);
+    for (unsigned i = RXSlots; i < RTW_TRANSFER_SLOTS; ++i)
+        if (!(ledger_.pending & (1U << i))) { index = i; break; }
+    IOSimpleLockUnlockEnableInterrupt(completionLock_, lock);
+    if (index == RTW_TRANSFER_SLOTS) return kIOReturnNoResources;
+
+    uint32_t chunks = 0;
+    mbuf_t packet = nullptr;
+    if (mbuf_allocpacket(MBUF_DONTWAIT, length, &chunks, &packet) || !packet)
+        return kIOReturnNoMemory;
+    /* Sequence: the driver owns it for raw frames; keep it in one 802.11
+     * sequence per Tx80211 call so retransmit logic stays coherent. */
+    uint16_t sequence = (uint16_t)((++radioNextSeq_ << 4) & 0xfff0);
+    const uint16_t sequenceLE = OSSwapHostToLittleInt16(sequence);
+    if (mbuf_copyback(packet, 0, length, frame, MBUF_DONTWAIT) ||
+        mbuf_copyback(packet, 22, 2, &sequenceLE, MBUF_DONTWAIT)) {
+        mbuf_freem(packet);
+        return kIOReturnNoMemory;
+    }
+    const bool multicast = (frame[4] & 1) != 0;
+    rtw88_usb_tx_options options{};
+    options.sequence = (uint16_t)(sequence >> 4);
+    options.queue = data ? (qos ? (frame[24] & 15U) : 0) : 18;
+    options.multicast = multicast;
+    options.band_5ghz = r88Channel_ > 14;
+    /* Fixed rates: OFDM 6 Mb/s (mgmt) and 12 Mb/s (AWDL data) = indices 4/6
+     * of the Linux-rtw88 rate table (0-3 CCK, 4-11 OFDM). */
+    options.rate = data ? (radioAwdlRate_ ? radioAwdlRate_ : 6) : 4;
+    options.rate_id = options.band_5ghz ? 7 : 8;
+    options.firmware_rate = 0;
+    options.disable_fallback = 1;
+    options.disable_queue_sequence = 1;
+    if (data && radioAwdlRate_) {
+        /* Per-frame TX-status request (SMPS-style tag), counted in
+         * rtlRadioAwdlTxStat by handle88C2H. */
+        options.request_report = 1;
+        options.report_tag = radioAwdlTag_;
+    }
+    uint8_t descriptor[48]{};
+    if (rtw88_usb_make_tx_descriptor(family_, length, &options, descriptor,
+                                     sizeof(descriptor)) != RTW88_USB_TX_OK) {
+        mbuf_freem(packet);
+        return kIOReturnBadArgument;
+    }
+    uint8_t pipe = 0;
+    if (rtw88_mac_queue_endpoint(&r88MAC_.fifo, options.queue, &pipe) ||
+        pipe >= endpoints_.num_bulk_out || !txPipes_[pipe]) {
+        mbuf_freem(packet);
+        return kIOReturnBadArgument;
+    }
+    size_t total = 48U + length;
+    const uint16_t mps = txMPS_[pipe];
+    if (mps != 64 && mps != 512 && mps != 1024) {
+        mbuf_freem(packet);
+        return kIOReturnBadArgument;
+    }
+    if (total % mps == 0) ++total;
+    if (total > TXCapacity) {
+        mbuf_freem(packet);
+        return kIOReturnBadArgument;
+    }
+    auto *t = &transfers_[index];
+    auto *bytes = static_cast<uint8_t *>(t->memory->getBytesNoCopy());
+    bzero(bytes, total);
+    memcpy(bytes, descriptor, 48);
+    if (mbuf_copydata(packet, 0, length, bytes + 48)) {
+        mbuf_freem(packet);
+        return kIOReturnNoMemory;
+    }
+    mbuf_freem(packet);
+    const int error = submit(index, txPipes_[pipe], (uint32_t)total);
+    if (error) return error == ENOBUFS ? kIOReturnNoResources : fromErrno(error);
+    return kIOReturnSuccess;
+}
+
+/* ---- AWDL milestone 3: parking, off-channel slots, rate, TX stats ---- */
+
+IOReturn RTWUSBController::radioSetChannel(const uint32_t *channel) {
+    /* ABI: parks the radio on one channel at 20 MHz while not associated.
+     * Queued behind pending commands by the gate; later scans return to it
+     * (see scanComplete). */
+    if (!channel) return kIOReturnBadArgument;
+    const uint8_t ch = (uint8_t)*channel;
+    if (!ch || !permits88Channel(ch)) return kIOReturnBadArgument;
+    if (!attached_ || !present_ || sleeping_ || usbError_ != kIOReturnSuccess ||
+        core_.core_error)
+        return kIOReturnNotReady;
+    auto &ic = core_.sc_ic;
+    if (ic.ic_state == IEEE80211_S_SCAN || ic.ic_state == IEEE80211_S_AUTH ||
+        ic.ic_state == IEEE80211_S_ASSOC || ic.ic_state == IEEE80211_S_RUN)
+        return kIOReturnBusy;
+    /* While idle the RTW88 backend is torn down (board/PHY state released);
+     * bring it back up exactly like the app's scan path does before any
+     * register traffic. This also revives a user-disabled radio: an external
+     * park command is an explicit radio use. */
+    userRadioDisabled_ = false;
+    const int recovery = recoverFamilyForControl();
+    if (recovery) return fromErrno(recovery);
+    if (core_.core_error || !r88PHY_.tables_loaded || !r88MAC_.mac_ready)
+        return kIOReturnNotReady;
+    const int error = set88Channel(ch, false);
+    if (error) return fromErrno(error);
+    radioIdleChannel_ = ch;
+    return kIOReturnSuccess;
+}
+
+void RTWUSBController::radioAwdlNullFrame(uint8_t powerManagement) {
+    /* One 24-byte null-data ToDS frame to the AP, sent on the BSS channel
+     * through the ordinary data path. Fire-and-forget: the subsequent USB
+     * register traffic of the channel switch gives the bulk-out a head
+     * start; if the AP misses it, it buffers until the next PM clear. */
+    auto &ic = core_.sc_ic;
+    auto *n = ic.ic_bss;
+    if (!n || ic.ic_state != IEEE80211_S_RUN || !r88Station_.initialized) return;
+    uint32_t chunks = 0;
+    mbuf_t packet = nullptr;
+    if (mbuf_allocpacket(MBUF_DONTWAIT, 24, &chunks, &packet) || !packet) return;
+    uint8_t frame[24]{};
+    frame[0] = IEEE80211_FC0_VERSION_0 | IEEE80211_FC0_TYPE_DATA | IEEE80211_FC0_SUBTYPE_NODATA;
+    frame[1] = (uint8_t)(IEEE80211_FC1_DIR_TODS |
+                         (powerManagement ? IEEE80211_FC1_PWR_MGT : 0));
+    memcpy(frame + 4, n->ni_bssid, 6);
+    memcpy(frame + 10, ic.ic_myaddr, 6);
+    memcpy(frame + 16, n->ni_bssid, 6);
+    const uint16_t sequence = (uint16_t)((++radioNextSeq_ << 4) & 0xfff0);
+    frame[22] = (uint8_t)sequence;
+    frame[23] = (uint8_t)(sequence >> 4);
+    if (mbuf_copyback(packet, 0, sizeof(frame), frame, MBUF_DONTWAIT)) {
+        mbuf_freem(packet);
+        return;
+    }
+    ieee80211_ref_node(n);
+    if (send88Frame(packet, n)) ieee80211_release_node(&ic, n);
+}
+
+IOReturn RTWUSBController::radioAwdlOffch(const uint32_t *channel) {
+    /* ABI: while associated, move the radio to another channel for an AWDL
+     * slot (at 20 MHz here; the same-block width refinement of the 8814
+     * driver is a later step), or back to the BSS with channel 0. Leaving
+     * sends a null frame with PM set and holds the data queues; returning
+     * sends PM clear and resumes them. Bookkeeping stays on the BSS so
+     * rtlRadioStatus keeps reporting it. */
+    if (!channel) return kIOReturnBadArgument;
+    const uint32_t requested = *channel;
+    const uint8_t ch = (uint8_t)requested;
+    radioOffchLastErr_ = 0;
+    radioOffchLastStep_ = 0;
+    if (ch != requested && requested != 0) {
+        radioOffchLastErr_ = EINVAL;
+        radioOffchLastStep_ = 5;
+        return kIOReturnBadArgument;
+    }
+    if (!attached_ || !present_ || sleeping_ || usbError_ != kIOReturnSuccess ||
+        core_.core_error)
+        return kIOReturnNoDevice;
+    auto &ic = core_.sc_ic;
+    if (!running_ || stopping_ || !r88Station_.initialized ||
+        r88Core_.firmware.last_error)
+        return kIOReturnNotReady;
+    /* Linked-state first: while idle the RTW88 backend is torn down and a
+     * channel check would misreport a legal AWDL channel as invalid. */
+    if (rxRecovery_.pending) return kIOReturnBusy;
+    if (ic.ic_state != IEEE80211_S_RUN || !ic.ic_bss) return kIOReturnBusy;
+    if (ch && !permits88Channel(ch)) {
+        radioOffchLastErr_ = EACCES;
+        radioOffchLastStep_ = 6;
+        return kIOReturnBadArgument;
+    }
+
+    const uint8_t home = r88Channel_;
+    if (!ch || ch == home) {
+        if (radioOffchState_) {
+            radioOffchState_ = 0;
+            if (r88Coex_ && (radioOffchSaved_.primary > 14) != (home > 14)) {
+                const int notify = coex88Notify(RTW88_CX_SWITCH_BAND,
+                                                IEEE80211_S_RUN,
+                                                radioOffchSaved_.primary);
+                if (notify) {
+                    radioOffchLastErr_ = notify;
+                    radioOffchLastStep_ = 3;
+                    core_.core_error = notify;
+                    return fromErrno(notify);
+                }
+            }
+            const int error = set88Operating(radioOffchSaved_, true);
+            if (error) {
+                radioOffchLastErr_ = error;
+                radioOffchLastStep_ = 4;
+                core_.core_error = error;
+                return fromErrno(error);
+            }
+            radioAwdlNullFrame(0);      /* PM clear on the BSS channel */
+            rtwn_start(&ic.ic_if);      /* flush the held data queues */
+        }
+        return kIOReturnSuccess;
+    }
+    const bool first = radioOffchState_ == 0;
+    if (first) {
+        radioOffchSaved_ = r88Operating_;
+        radioAwdlNullFrame(1);          /* PM set while still on the BSS */
+        radioOffchState_ = 1;
+    }
+    if (r88Coex_ && (ch > 14) != (home > 14)) {
+        const int notify = coex88Notify(RTW88_CX_SWITCH_BAND, IEEE80211_S_RUN, ch);
+        if (notify) {
+            if (first) {
+                radioOffchState_ = 0;
+                radioAwdlNullFrame(0);
+            }
+            radioOffchLastErr_ = notify;
+            radioOffchLastStep_ = 1;
+            core_.core_error = notify;
+            return fromErrno(notify);
+        }
+    }
+    const int error = set88Operating(rtw88_station_operating{ch, ch, 20, 0}, false);
+    if (error) {
+        if (first) {
+            radioOffchState_ = 0;
+            radioAwdlNullFrame(0);
+        }
+        radioOffchLastErr_ = error;
+        radioOffchLastStep_ = 2;
+        core_.core_error = error;
+        return fromErrno(error);
+    }
+    /* Keep the ABI-visible radio state on the BSS while the PHY sits in the
+     * AWDL slot; r88RadioState(BSS) is 0 meanwhile, so the data path stays
+     * down even if something calls rtwn_start directly. */
+    r88Operating_ = radioOffchSaved_;
+    r88Channel_ = radioOffchSaved_.primary;
+    r88RX_.current_width = (uint8_t)(radioOffchSaved_.width_mhz == 80 ? 2 :
+        radioOffchSaved_.width_mhz == 40 ? 1 : 0);
+    return kIOReturnSuccess;
+}
+
+IOReturn RTWUSBController::radioAwdlRate(const uint32_t *rate) {
+    /* ABI: TX descriptor rate index for unicast AWDL data frames; 0 = the
+     * fixed 12 Mb/s. While set, frames ask the chip for a TX-status report
+     * tagged radioAwdlTag_, counted in rtlRadioAwdlTxStat. */
+    if (!rate) return kIOReturnBadArgument;
+    const uint32_t value = *rate;
+    if (!(value == 0 || (value >= 0x04 && value <= 0x0b) ||
+          (value >= 0x0c && value <= 0x13)))
+        return kIOReturnBadArgument;
+    radioAwdlRate_ = value;
+    /* Reserve the SMPS tag slot so the coex tag search never picks it. */
+    r88SMPSTagRetire_[radioAwdlTag_ >> 2] = value ? UINT64_MAX : 0;
+    return kIOReturnSuccess;
+}
+
+IOReturn RTWUSBController::radioAwdlTxStat(struct rtl_radio_awdl_txstat *out) {
+    /* The 8821C TX-status report carries only the tag and an acked bit, so
+     * the retry breakdown stays 0 until a per-retry C2H is identified. */
+    if (!out) return kIOReturnBadArgument;
+    bzero(out, sizeof(*out));
+    out->clean = radioAwdlTxStat_.clean;
+    out->retried = radioAwdlTxStat_.retried;
+    out->retried2 = radioAwdlTxStat_.retried2;
+    out->lost = radioAwdlTxStat_.lost;
+    out->rate = radioAwdlRate_;
+    out->reports = radioAwdlTxStat_.reports;
+    return kIOReturnSuccess;
 }

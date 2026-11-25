@@ -43,6 +43,7 @@
 #include "rtw/RTW88Station.h"
 #include "rtw/RTW88RX.h"
 #include "rtw/RTW88USBDataPath.h"
+#include "rtw/RTLRadioABI.h"
 #include <net80211/ieee80211_amrr.h>
 
 class RTWUSBController final : public IOEthernetController {
@@ -67,6 +68,11 @@ public:
     IOReturn setPowerState(unsigned long, IOService *) override;
     IOReturn newUserClient(task_t, void *, UInt32, OSDictionary *, IOUserClient **) override;
     IOReturn controlRequest(uint32_t, const void *, size_t, void *, size_t *);
+    IOReturn callPlatformFunction(const OSSymbol *, bool, void *, void *, void *, void *) override;
+    IOReturn callPlatformFunction(const char *, bool, void *, void *, void *, void *) override;
+    bool radioHookActive() const { return radioDataHook_ != nullptr; }
+    rtl_radio_rx_fn radioHookFn() const { return radioDataHook_; }
+    void *radioHookCtx() const { return radioDataHookCtx_; }
 protected:
     IOReturn registerWithPolicyMaker(IOService *) override;
     bool configureInterface(IONetworkInterface *) override;
@@ -74,7 +80,7 @@ protected:
 private:
     enum { RXSlots = 4, TXCapacity = 4352 };
     enum GateOperation { Initialize = 1, Shutdown, Enable, Disable, Output,
-                         Control, Terminated, Sleep, Wake, TeardownReady };
+                         Control, Terminated, Sleep, Wake, TeardownReady, RadioABI };
     struct Transfer {
         RTWUSBController *owner;
         IOBufferMemoryDescriptor *memory;
@@ -87,6 +93,7 @@ private:
     struct OutputCall { mbuf_t packet; bool consumed; };
     struct ControlCall { uint32_t selector; const void *input; size_t length;
                          void *output; size_t *outputLength; };
+    struct RadioABICall { const char *fn; void *p1; void *p2; IOReturn result; };
     IOUSBHostInterface *usb_ = nullptr;
     IOUSBHostPipe *rxPipe_ = nullptr;
     IOUSBHostPipe *txPipes_[4]{};
@@ -364,4 +371,40 @@ private:
     void status(RTWControlStatus *);
     void scanResults(RTWControlScanResults *);
     void channelMap(RTWControlChannelMap *) const;
+    /* RTL radio ABI (rtw/RTLRadioABI.h): the surface an IO80211 layer kext
+     * drives through callPlatformFunction. Runs on the controller gate. */
+    rtl_radio_rx_fn radioDataHook_ = nullptr;
+    void *radioDataHookCtx_ = nullptr;
+    rtl_radio_awdl_rx_fn radioAwdlHook_ = nullptr;
+    void *radioAwdlHookCtx_ = nullptr;
+    bool radioABIAdmits() const;
+    void radioABIEntry(RadioABICall *);
+    IOReturn dispatchRadioABI(const char *, void *, void *);
+    IOReturn radioScanStart(const uint32_t *, const uint32_t *);
+    void radioScanCopy(struct rtl_radio_bss *, uint32_t *);
+    void radioChannels(struct rtl_radio_chan *, uint32_t *);
+    void radioStatus(struct rtl_radio_status *);
+    IOReturn radioJoin(struct rtl_radio_join *);
+    IOReturn radioLeave();
+    IOReturn radioTx(mbuf_t);
+    IOReturn radioTx80211(const uint8_t *, uint32_t *);
+    IOReturn radioDataHook(rtl_radio_rx_fn, void *);
+    IOReturn radioSetChannel(const uint32_t *);
+    IOReturn radioAwdlOffch(const uint32_t *);
+    IOReturn radioAwdlRate(const uint32_t *);
+    IOReturn radioAwdlTxStat(struct rtl_radio_awdl_txstat *);
+    void radioAwdlNullFrame(uint8_t);
+    uint16_t radioNextSeq_ = 0;
+    /* AWDL off-channel state (see RTLRadioABI.h semantics) */
+    uint32_t radioIdleChannel_ = 0;             /* parked channel while IDLE */
+    rtw88_station_operating radioOffchSaved_{}; /* BSS operating state during a slot */
+    uint8_t radioOffchState_ = 0;               /* 0 = none, 1 = AWDL slot active */
+    uint32_t radioAwdlRate_ = 0;                /* TX descriptor rate index, 0 = fixed 12 Mb/s */
+    /* Bench diagnostics: errno + failing step of the last offch request
+     * (1 coex band switch, 2 tune-to-AWDL, 3 restore coex, 4 restore tune). */
+    int radioOffchLastErr_ = 0;
+    uint8_t radioOffchLastStep_ = 0;
+    struct rtl_radio_awdl_txstat radioAwdlTxStat_{};
+    uint8_t radioAwdlTag_ = 0xfc;               /* TX-status tag, masked 0xfc like the SMPS tags */
+    void radioLinkRefresh();
 };

@@ -58,6 +58,8 @@
 #include <net/if_media.h>
 #include <net/if_llc.h>
 
+#include "rtw/RTLRadioABIGlue.h"
+
 #if NBPFILTER > 0
 #include <net/bpf.h>
 #endif
@@ -1075,7 +1077,25 @@ ieee80211_enqueue_data(struct ieee80211com *ic, mbuf_t m,
     struct ether_header *eh;
     mbuf_t m1;
     mbuf_t m2;
-    
+
+    /* RTL radio ABI: an external IO80211 layer owns the data path while its
+     * hook is attached; deliver this already-decapsulated Ethernet frame and
+     * consume it. EXCEPTION: EAPOL. On this driver the WPA2 4-way handshake
+     * is owned by net80211's own supplicant (ic_psk + IEEE80211_F_PSK) and
+     * its input handler is directly below; diverting EAPOL starved the
+     * supplicant and every association died ~1 s in (4-way timeout, boot
+     * 9-11). DrogaBox's layer forwards EAPOL back through his ABI; ours has
+     * no such round-trip, so pass EAPOL through to the normal input path. */
+    if (rtw_radio_rx_hook_active()) {
+        eh = mtod(m, struct ether_header *);
+        if (eh->ether_type != htons(ETHERTYPE_PAE)) {
+            if (!rtw_radio_rx_hook_deliver(m))
+                mbuf_freem(m);
+            return;
+        }
+        /* EAPOL: fall through to net80211's supplicant below. */
+    }
+
     eh = mtod(m, struct ether_header *);
     
     if ((ic->ic_flags & IEEE80211_F_RSNON) && !ni->ni_port_valid &&
