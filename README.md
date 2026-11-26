@@ -10,15 +10,15 @@ This fork adds two things to the original
 1. **A radio interface ("radio ABI")** in the driver: about 20
    `rtlRadio*` calls (scan, join, send, receive, AWDL channel slots, AWDL
    port, delivery reports) that another kext can use to drive the radio.
-2. **The AirLayer** (`airlayer/`, `RTL8814AirLayer.kext`) by
-   [DrogaBox](https://github.com/DrogaBox/RTL8814Native). It implements the
+2. **The AirLayer** (`airlayer/`, `RTL88AirLayer.kext`, based on DrogaBox's
+   `RTL8814AirLayer` from [RTL8814Native](https://github.com/DrogaBox/RTL8814Native)). It implements the
    classes macOS expects from an Apple Wi-Fi card on top of that interface.
 
 ```
  macOS Wi-Fi menu · AirDrop · airportd · sharingd     (Apple, unchanged)
  IO80211Family: Apple's Wi-Fi and AWDL logic          (Apple, unchanged)
         │
- RTL8814AirLayer.kext   en1 = native Wi-Fi, awdl0 = AWDL / AirDrop
+ RTL88AirLayer.kext     en1 = native Wi-Fi, awdl0 = AWDL / AirDrop
         │  rtlRadio* calls
  TahoeRealtekWiFi.kext  USB radio driver (rtw88 based)
         │  USB
@@ -74,14 +74,14 @@ extension cable that puts the adapter in the open helps.
 
 ```sh
 ./build.command --kext          # -> Release/TahoeRealtekWiFi.kext
-cd airlayer && ./build_airlayer.sh   # -> airlayer/Build/RTL8814AirLayer.kext
+cd airlayer && ./build_airlayer.sh   # -> airlayer/Build/RTL88AirLayer.kext
 ```
 
 ## Install (OpenCore)
 
 1. Copy both kexts to `EFI/OC/Kexts/`.
 2. In `config.plist` → `Kernel` → `Add`, add `TahoeRealtekWiFi.kext` and,
-   **after it**, `RTL8814AirLayer.kext`.
+   **after it**, `RTL88AirLayer.kext`.
 3. Add boot-args (`NVRAM` → `Add` → `7C436110-AB2A-4BBB-A880-FE41995C9F82` →
    `boot-args`):
 

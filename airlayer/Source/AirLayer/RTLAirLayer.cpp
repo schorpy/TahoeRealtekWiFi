@@ -36,7 +36,7 @@ static void airLog(const char *fmt, ...)
 	va_start(ap, fmt);
 	vsnprintf(buf, sizeof(buf), fmt, ap);
 	va_end(ap);
-	IOLog("RTL8814AirLayer: %s\n", buf);
+	IOLog("RTL88AirLayer: %s\n", buf);
 	if (!gLogTarget || !gLogLock)
 		return;
 	OSString *line = OSString::withCString(buf);
@@ -2190,7 +2190,7 @@ void RTLAirController::free()
  * AppleBCMWLANBusInterfacePCIe::deferredStart does.
  * CCPipeOptions is 0x350 bytes, CCStreamOptions 0x358 (offsets from that code).
  */
-#define CC_OWNER        "com.DrogaBox.driver.RTL8814AirLayer"
+#define CC_OWNER        "io.github.schorpy.RTL88AirLayer"
 #define CC_PIPE_OPTS    0x350
 #define CC_STREAM_OPTS  0x358
 
@@ -2383,7 +2383,7 @@ IOReturn RTLAirController::getDRIVER_VERSION(IO80211SkywalkInterface *, apple802
 	STUB_ENTER();
 	if (!vd)
 		return kIOReturnBadArgument;
-	putStr((uint8_t *)vd, "RTL8814AirLayer 0.32 (radio ABI 2)");
+	putStr((uint8_t *)vd, "RTL88AirLayer 0.32 (radio ABI 2)");
 	return kIOReturnSuccess;
 }
 

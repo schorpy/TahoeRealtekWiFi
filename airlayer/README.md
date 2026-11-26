@@ -1,4 +1,4 @@
-# AirLayer (RTL8814AirLayer.kext) for TahoeRealtekWiFi
+# AirLayer (RTL88AirLayer.kext) for TahoeRealtekWiFi
 
 This folder holds the native IO80211 layer that lets macOS use the USB radio as
 if it were an Apple Wi-Fi card: the normal Wi-Fi menu on `en1`, and `awdl0`
@@ -17,6 +17,10 @@ GPL-2.0; see `LICENSE` in this folder.
 
 Changes made here:
 
+- Renamed from `RTL8814AirLayer.kext` to `RTL88AirLayer.kext` (bundle ID
+  `io.github.schorpy.RTL88AirLayer`), since this build drives the rtw88 chips
+  through TahoeRealtekWiFi. Class names and boot-args are unchanged.
+
 - `Source/AirLayer/Info-Tahoe.plist`: personality that attaches the layer to
   TahoeRealtekWiFi (`IOProviderClass RTWUSBController`). It is the default.
 - Fixes in `RTLAirLayer.cpp` and `VersionGate.h` (WPA2 passphrase to PMK,
@@ -28,7 +32,7 @@ Changes made here:
 
 ```sh
 cd airlayer
-./build_airlayer.sh          # -> Build/RTL8814AirLayer.kext
+./build_airlayer.sh          # -> Build/RTL88AirLayer.kext
 ```
 
 The layer is built against the IO80211 class layout of macOS 26.x

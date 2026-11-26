@@ -1,6 +1,7 @@
 #!/bin/bash
 #
-# Builds Build/RTL8814AirLayer.kext, the Phase 5 native IO80211 layer
+# Builds Build/RTL88AirLayer.kext (DrogaBox's RTL8814AirLayer, renamed for
+# the rtw88 TahoeRealtekWiFi driver), the Phase 5 native IO80211 layer
 # (Source/AirLayer). Separate from ./build.sh: RTL8814Native.kext does not
 # change. The layer is built against Source/IO80211/IO80211_25_6_0.h, so it
 # only fits macOS 26.x / Darwin 25.6.0. At boot a version gate (GateLogic.h)
@@ -21,8 +22,8 @@ cd "$(dirname "$0")"
 ARCH="${ARCH:-x86_64}"
 BUILD="Build"
 OBJ="$BUILD/obj_airlayer"
-KEXT="$BUILD/RTL8814AirLayer.kext"
-BUNDLE_ID="com.DrogaBox.driver.RTL8814AirLayer"
+KEXT="$BUILD/RTL88AirLayer.kext"
+BUNDLE_ID="io.github.schorpy.RTL88AirLayer"
 
 SDK="$(xcrun --sdk macosx --show-sdk-path)"
 SDK_VER="$(xcrun --sdk macosx --show-sdk-platform-version)"
@@ -38,7 +39,7 @@ CXXFLAGS="-x c++ -std=c++17 -fapple-kext -fno-rtti -fno-exceptions -fno-use-cxa-
 rm -rf "$OBJ" "$KEXT"
 mkdir -p "$OBJ" "$KEXT/Contents/MacOS"
 
-echo "== RTL8814AirLayer build (arch $ARCH) =="
+echo "== RTL88AirLayer build (arch $ARCH) =="
 # Known-build table for the version gate (class sizes from the header, validated
 # builds from Tools/airlayer_builds.txt).
 python3 -I Tools/airlayer_gate.py gen
@@ -69,7 +70,7 @@ else
 fi
 ld -kext -arch "$ARCH" \
    -platform_version macos "$SDK_VER" "$SDK_VER" \
-   -o "$KEXT/Contents/MacOS/RTL8814AirLayer" \
+   -o "$KEXT/Contents/MacOS/RTL88AirLayer" \
    "$OBJ/info.o" "$OBJ/RTLAirLayer.o" "$OBJ/AWDLInterface.o" \
    -L"$SDK/usr/lib" -lkmod $KEXT_LIB
 
