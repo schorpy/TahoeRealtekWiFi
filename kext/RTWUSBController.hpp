@@ -103,6 +103,11 @@ private:
     IOCommandGate *gate_ = nullptr;
     IOInterruptEventSource *completionEvent_ = nullptr;
     IOTimerEventSource *scanTimer_ = nullptr, *calibTimer_ = nullptr, *watchdogTimer_ = nullptr;
+    /* Activity LED (RTL8821CU): blinks while data frames move. */
+    IOTimerEventSource *ledTimer_ = nullptr;
+    uint32_t ledTraffic_ = 0, ledSeen_ = 0;
+    bool ledOn_ = false, ledActive_ = false;
+    static void ledAction(OSObject *, IOTimerEventSource *);
     IOSimpleLock *completionLock_ = nullptr;
     IOLock *lifecycleLock_ = nullptr;
     Transfer transfers_[RTW_TRANSFER_SLOTS]{};
@@ -382,6 +387,15 @@ private:
     IOReturn dispatchRadioABI(const char *, void *, void *);
     IOReturn radioScanStart(const uint32_t *, const uint32_t *);
     void radioScanCopy(struct rtl_radio_bss *, uint32_t *);
+    /* Networks from earlier scans. net80211 purges every node but the BSS
+     * each IEEE80211_CACHE_WAIT (30 s) while associated, so without this the
+     * Wi-Fi menu lists only the current network once connected. */
+    static constexpr uint32_t kScanCacheMax = 48;
+    static constexpr uint64_t kScanCacheAgeMs = 600000;
+    struct rtl_radio_bss *scanCache_ = nullptr;
+    uint64_t scanCacheMs_[kScanCacheMax]{};
+    struct rtl_radio_bss *scanScratch_ = nullptr;
+    void scanCacheSnapshot();
     void radioChannels(struct rtl_radio_chan *, uint32_t *);
     void radioStatus(struct rtl_radio_status *);
     IOReturn radioJoin(struct rtl_radio_join *);

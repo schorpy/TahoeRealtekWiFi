@@ -1570,6 +1570,7 @@ void RTLAirController::radioGone(IOService *rad)
 	bool scan = _scanPending;
 	_phase = kIdle;
 	_scanPending = false;
+	_scanServe = false;
 	bzero(&_joinReq, sizeof(_joinReq));
 	IOLockUnlock(_lock);
 	LOG("radio leaving (re-enumeration), phase %d scan %u", phase, scan);
@@ -2536,9 +2537,26 @@ IOReturn RTLAirController::startScan(const uint32_t *channels, uint32_t count, b
 		count = 0;
 	radioStatus(&st);
 	IOLockLock(_lock);
-	if (_scanPending || _phase == kJoining || _phase == kRoaming) {
+	if (_scanPending) {
 		IOLockUnlock(_lock);
 		return kIOReturnBusy;
+	}
+	/* While a join or roam runs the radio cannot scan. Refusing (Busy) left
+	 * the Wi-Fi menu empty for up to 45 s after a failed join; answer from
+	 * the radio's list instead (live nodes plus the networks it remembers),
+	 * without touching the radio. The poll thread posts the results. */
+	if (_phase == kJoining || _phase == kRoaming) {
+		_scanPending = true;
+		_scanServe = true;
+		_scanLinked = false;
+		_scanTicks = 0;
+		_scanChCount = count;
+		if (count)
+			memcpy(_scanCh, channels, count * sizeof(*channels));
+		IOLockUnlock(_lock);
+		LOG("scan during join: answered from the radio's list");
+		schedulePoll(1);
+		return kIOReturnSuccess;
 	}
 	/* a driver without the list ignores it and scans the whole plan */
 	IOReturn r = count ? radio(RTL_RADIO_FN_SCAN_START, (void *)channels, &count, &flags)
@@ -2789,6 +2807,7 @@ void RTLAirController::poll()
 	radioStatus(&st);
 	IOLockLock(_lock);
 	bool scan = _scanPending;
+	bool serve = _scanServe;
 	bool scanLinked = _scanLinked;
 	int phase = _phase;
 	uint32_t scanTicks = scan ? ++_scanTicks : 0;
@@ -2799,7 +2818,7 @@ void RTLAirController::poll()
 	if (scan) {
 		/* An associated radio stays LINKED while it scans: builds from 4.11 set
 		 * st.scanning, older ones get a fixed 2.75 s. 10 s cap either way. */
-		bool busy = st.state == RTL_RADIO_S_SCAN || st.scanning || (scanLinked && scanTicks < 10);
+		bool busy = !serve && (st.state == RTL_RADIO_S_SCAN || st.scanning || (scanLinked && scanTicks < 10));
 		if (busy && scanTicks < 40)
 			next = 250;
 		else
@@ -2909,6 +2928,7 @@ void RTLAirController::finishScan()
 	LOG("scan done, %u BSS, %u on the %u channels asked", n, sent, want);
 	IOLockLock(_lock);
 	_scanPending = false;
+	_scanServe = false;
 	IOLockUnlock(_lock);
 	infraTouch();                   /* WCL associates right after the results */
 }

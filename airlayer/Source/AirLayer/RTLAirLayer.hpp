@@ -248,6 +248,7 @@ private:
 	IOLock *_lock;
 	enum { kIdle, kJoining, kLinked, kRoaming } _phase;
 	bool _scanPending;
+	bool _scanServe;      /* answer the pending scan from the radio's list at the next poll */
 	bool _scanLinked;               /* scan started while associated */
 	enum { kScanReqMax = 64 };
 	uint32_t _scanCh[kScanReqMax];  /* channels the pending scan asked for */

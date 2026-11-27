@@ -44,6 +44,8 @@
     uint32_t r88CoexTXPackets_=0,r88CoexRXPackets_=0;
     uint8_t r88CoexRXRate_=2,r88CoexTXRate_=2;
     bool r88CoexScanning_=false,r88CoexOneSS_=false;
+    void led88(bool on);
+    void ledWrite88(bool on);
     bool r88SMPSPending_=false,r88SMPSWaitingUSB_=false;
     uint8_t r88SMPSTag_=0,r88SMPSNextTag_=0,r88SMPSDesired_=0;
     uint8_t r88SMPSBSSID_[6]{};

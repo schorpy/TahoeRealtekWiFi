@@ -875,7 +875,7 @@ void RTWUSBController::abortTransfers() {
     rxRecovery_.nextAttemptMS=0;
     rxRecovery_.pending=rxRecovery_.cleared=rxRecovery_.refilling=false;
     cancelWpaRecovery();
-    if(scanTimer_)scanTimer_->cancelTimeout();if(calibTimer_)calibTimer_->cancelTimeout();if(watchdogTimer_)watchdogTimer_->cancelTimeout();
+    if(scanTimer_)scanTimer_->cancelTimeout();if(calibTimer_)calibTimer_->cancelTimeout();if(watchdogTimer_)watchdogTimer_->cancelTimeout();if(ledTimer_)ledTimer_->cancelTimeout();ledActive_=false;
     IOInterruptState lock=IOSimpleLockLockDisableInterrupt(completionLock_);
     /* Startup rollback owns its eligible zero-byte RX error separately. */
     const uint32_t stopped=ledger_.pending&~rxRecovery_.initialDrainMask;
@@ -1369,6 +1369,7 @@ void RTWUSBController::receive(const uint8_t*bytes,size_t length) {
         /* Only decoded AU PHY status supplies physical-channel evidence. A
          * missing/zero PHY channel stays unknown; never copy the software
          * scan channel into it. Mismatches do not affect packet delivery. */
+        if(p.mpdu&&p.mpdu_length>=24&&(p.mpdu[0]&IEEE80211_FC0_TYPE_MASK)==IEEE80211_FC0_TYPE_DATA)++ledTraffic_;
         observeDFSFrame(p.mpdu,p.mpdu_length,scanPhysicalChannel);
         rtw::scanDiagnosticsFrame(scanDiag_,core_.sc_ic.ic_state==IEEE80211_S_SCAN,
             p.mpdu,p.mpdu_length,info.rxi_chan,scanPhysicalChannel);
@@ -1525,6 +1526,7 @@ void RTWUSBController::watchdogAction(OSObject*o,IOTimerEventSource*) {
         ieee80211_set_link_state(&ic,LINK_STATE_DOWN);
         (void)stateTransition(&ic,IEEE80211_S_SCAN,-1);
     }
+    s->scanCacheSnapshot();
     ic.ic_if.if_watchdog(&ic.ic_if);
     if(rtwn_io_error(&s->core_))s->quiesce(false);else s->watchdogTimer_->setTimeoutMS(1000);
 }
@@ -2242,6 +2244,8 @@ bool RTWUSBController::start(IOService*provider) {
     gate_=IOCommandGate::commandGate(this);completionEvent_=IOInterruptEventSource::interruptEventSource(this,completionAction);
     scanTimer_=IOTimerEventSource::timerEventSource(this,scanAction);calibTimer_=IOTimerEventSource::timerEventSource(this,calibAction);watchdogTimer_=IOTimerEventSource::timerEventSource(this,watchdogAction);
     if(!gate_||!completionEvent_||!scanTimer_||!calibTimer_||!watchdogTimer_||loop_->addEventSource(gate_)!=kIOReturnSuccess||loop_->addEventSource(completionEvent_)!=kIOReturnSuccess||loop_->addEventSource(scanTimer_)!=kIOReturnSuccess||loop_->addEventSource(calibTimer_)!=kIOReturnSuccess||loop_->addEventSource(watchdogTimer_)!=kIOReturnSuccess){reportStartStage("event-sources",kIOReturnNoResources);releasePlatform();super::stop(provider);markTeardownReady();return false;}
+    ledTimer_=IOTimerEventSource::timerEventSource(this,ledAction);
+    if(ledTimer_&&loop_->addEventSource(ledTimer_)!=kIOReturnSuccess){ledTimer_->release();ledTimer_=nullptr;}  /* optional: LED stays steady */
     completionEvent_->enable();rtw_transfer_reset(&ledger_);
     if(!taskq_is_initialized(systq)){reportStartStage("taskqueue",kIOReturnNoResources);gate_->runAction(gated,(void*)Shutdown);releasePlatform();super::stop(provider);markTeardownReady();return false;}
     if(gate_->runAction(gated,(void*)Initialize)!=kIOReturnSuccess){gate_->runAction(gated,(void*)Shutdown);releasePlatform();super::stop(provider);markTeardownReady();return false;}
@@ -2286,15 +2290,17 @@ void RTWUSBController::closeUSBProvider() {
 void RTWUSBController::releasePlatform() {
     if(retainedForPending_)return;
     if(completionLock_)freeTransfers();
+    if(scanCache_){IOFree(scanCache_,sizeof(*scanCache_)*kScanCacheMax);scanCache_=nullptr;}
+    if(scanScratch_){IOFree(scanScratch_,sizeof(*scanScratch_)*kScanCacheMax);scanScratch_=nullptr;}
     if(cleanupCall_){thread_call_free(cleanupCall_);cleanupCall_=nullptr;}
     if(netif_){detachInterface(netif_,true);netif_->release();netif_=nullptr;}stats_=nullptr;
     IOCommandGate *oldGate=gate_;
     if(lifecycleLock_){IOLockLock(lifecycleLock_);oldGate=gate_;gate_=nullptr;IOLockUnlock(lifecycleLock_);}
     if(loop_){
-        IOEventSource*events[]={scanTimer_,calibTimer_,watchdogTimer_,completionEvent_,oldGate};
+        IOEventSource*events[]={scanTimer_,calibTimer_,watchdogTimer_,ledTimer_,completionEvent_,oldGate};
         for(auto*event:events)if(event){if(event!=oldGate)event->disable();if(event->getWorkLoop()==loop_)loop_->removeEventSource(event);event->release();}
     }
-    scanTimer_=calibTimer_=watchdogTimer_=nullptr;completionEvent_=nullptr;gate_=nullptr;
+    scanTimer_=calibTimer_=watchdogTimer_=ledTimer_=nullptr;completionEvent_=nullptr;gate_=nullptr;
     if(rxPipe_){rxPipe_->release();rxPipe_=nullptr;}for(auto*&p:txPipes_)if(p){p->release();p=nullptr;}
     closeUSBProvider();
     if(lifecycleLock_)IOLockLock(lifecycleLock_);
@@ -2713,6 +2719,17 @@ void RTWUSBController::radioScanCopy(struct rtl_radio_bss *out, uint32_t *count)
     auto&ic = core_.sc_ic;
     struct ieee80211_node *node = RB_MIN(ieee80211_tree, &ic.ic_tree);
     while (node && filled < capacity) {
+        /* Hidden networks beacon an empty or zero-filled SSID. Apple's menu
+         * does not list them (they are joined via "Other..."); passed on they
+         * showed as a nameless network with a warning sign. The BSS we are on
+         * is always reported. */
+        bool named = false;
+        for (unsigned i = 0; i < node->ni_esslen && i < 32 && !named; i++)
+            named = node->ni_essid[i] != 0;
+        if (!named && node != ic.ic_bss) {
+            node = RB_NEXT(ieee80211_tree, &ic.ic_tree, node);
+            continue;
+        }
         if (node->ni_esslen <= 32 && node->ni_chan && node->ni_chan != IEEE80211_CHAN_ANYC) {
             auto *r = &out[filled];
             bzero(r, sizeof(*r));
@@ -2728,16 +2745,73 @@ void RTWUSBController::radioScanCopy(struct rtl_radio_bss *out, uint32_t *count)
             r->rssi_dbm = node->ni_rssi ? (int16_t)node->ni_rssi - 100 : 0;
             r->capinfo = node->ni_capinfo;
             r->intval = node->ni_intval;
-            if (node->ni_rsnie && node->ni_rsnie[1] >= 1) {
-                const uint16_t len = (uint16_t)(2 + node->ni_rsnie[1]);
-                r->ies_len = len <= RTL_RADIO_MAX_IES ? len : RTL_RADIO_MAX_IES;
-                memcpy(r->ies, node->ni_rsnie, r->ies_len);
+            /* ABI: elements from the SSID on. Without an SSID element
+             * airportd listed the network as hidden (with only the RSN
+             * element it was a nameless WPA2 entry next to the real one). */
+            uint16_t ie = 0;
+            r->ies[ie++] = IEEE80211_ELEMID_SSID;
+            r->ies[ie++] = r->ssid_len;
+            memcpy(r->ies + ie, r->ssid, r->ssid_len); ie += r->ssid_len;
+            r->ies[ie++] = IEEE80211_ELEMID_DSPARMS;
+            r->ies[ie++] = 1;
+            r->ies[ie++] = r->channel;
+            if (node->ni_rsnie && node->ni_rsnie[1] >= 1 &&
+                ie + 2u + node->ni_rsnie[1] <= RTL_RADIO_MAX_IES) {
+                memcpy(r->ies + ie, node->ni_rsnie, 2u + node->ni_rsnie[1]);
+                ie += 2u + node->ni_rsnie[1];
             }
+            r->ies_len = ie;
             ++filled;
         }
         node = RB_NEXT(ieee80211_tree, &ic.ic_tree, node);
     }
+    /* Remember what the node table holds now, then add remembered networks
+     * it has lost (see scanCache_). Nothing is retuned: no off-channel
+     * visits while associated (bgscan attempts bcdc9e99/ef38b2a6 dropped
+     * the link). */
+    if (!scanCache_) {
+        scanCache_ = static_cast<rtl_radio_bss *>(IOMallocZero(sizeof(*scanCache_) * kScanCacheMax));
+        if (scanCache_) bzero(scanCacheMs_, sizeof(scanCacheMs_));
+    }
+    if (scanCache_) {
+        const uint64_t now = nowMS();
+        const uint32_t live = filled;
+        for (uint32_t i = 0; i < live; i++) {
+            bool named = false;                       /* hidden: nothing to list */
+            for (uint32_t b = 0; b < out[i].ssid_len && b < 32 && !named; b++) named = out[i].ssid[b] != 0;
+            if (!named) continue;
+            uint32_t slot = kScanCacheMax, oldest = 0;
+            for (uint32_t k = 0; k < kScanCacheMax; k++) {
+                if (scanCacheMs_[k] && !memcmp(scanCache_[k].bssid, out[i].bssid, 6)) { slot = k; break; }
+                if (scanCacheMs_[k] < scanCacheMs_[oldest]) oldest = k;
+            }
+            if (slot == kScanCacheMax) slot = oldest;
+            memcpy(&scanCache_[slot], &out[i], sizeof(*scanCache_));
+            scanCacheMs_[slot] = now;
+        }
+        for (uint32_t k = 0; k < kScanCacheMax && filled < capacity; k++) {
+            if (!scanCacheMs_[k]) continue;
+            if (now - scanCacheMs_[k] > kScanCacheAgeMs) { scanCacheMs_[k] = 0; continue; }
+            bool present = false;
+            for (uint32_t i = 0; i < live && !present; i++)
+                present = !memcmp(out[i].bssid, scanCache_[k].bssid, 6);
+            if (present) continue;
+            memcpy(&out[filled++], &scanCache_[k], sizeof(*scanCache_));
+        }
+    }
     if (count) *count = filled;
+}
+
+/* Once a second (watchdog): copy the node table into scanCache_ before
+ * net80211's 30 s purge or a join's INIT empties it, so every network a
+ * scan heard reaches the Wi-Fi menu, not only those still in the table
+ * when the layer asks. */
+void RTWUSBController::scanCacheSnapshot() {
+    if (!scanScratch_)
+        scanScratch_ = static_cast<rtl_radio_bss *>(IOMallocZero(sizeof(*scanScratch_) * kScanCacheMax));
+    if (!scanScratch_) return;
+    uint32_t n = kScanCacheMax;
+    radioScanCopy(scanScratch_, &n);
 }
 
 IOReturn RTWUSBController::radioJoin(struct rtl_radio_join *join) {
@@ -2771,7 +2845,32 @@ IOReturn RTWUSBController::radioJoin(struct rtl_radio_join *join) {
     memcpy(core_.sc_ic.ic_des_essid, join->ssid, join->ssid_len);
     joinRequested_ = true;
     IOReturn result = enableStation();
-    if (result != kIOReturnSuccess) quiesce(true);
+    if (result != kIOReturnSuccess) { quiesce(true); return result; }
+    /* Join on the known channel. The restart above begins a full sweep
+     * (36 channels, ~8-10 s) and airportd gives up after ~10 s (-3905:
+     * 2026-11-26 20:55, first join after Wi-Fi power-on). With the network
+     * in scanCache_, drop every other channel from the sweep; if it is not
+     * found there, net80211 starts the next round on all channels. */
+    auto &ic = core_.sc_ic;
+    uint8_t want = 0;
+    static const uint8_t zero[6] = {};
+    if (scanCache_ && ic.ic_state == IEEE80211_S_SCAN) {
+        const uint64_t now = nowMS();
+        uint64_t best = 0;
+        for (uint32_t k = 0; k < kScanCacheMax; k++) {
+            const auto &b = scanCache_[k];
+            if (!scanCacheMs_[k] || now - scanCacheMs_[k] > kScanCacheAgeMs) continue;
+            if (b.ssid_len != join->ssid_len || memcmp(b.ssid, join->ssid, b.ssid_len)) continue;
+            if (memcmp(join->bssid, zero, 6) && memcmp(join->bssid, b.bssid, 6)) continue;
+            if (!b.channel || !permits88Channel(b.channel) || scanCacheMs_[k] <= best) continue;
+            best = scanCacheMs_[k]; want = b.channel;
+        }
+    }
+    if (want) {
+        for (unsigned c = 0; c <= IEEE80211_CHAN_MAX; c++)
+            if (c != want) clrbit(ic.ic_chan_scan, c);
+        if (isset(ic.ic_chan_active, want)) setbit(ic.ic_chan_scan, want);
+    }
     return result;
 }
 

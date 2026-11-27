@@ -126,7 +126,7 @@ int RTWUSBController::start88(){
  e=rtw88_station_initialize(&r88Station_,&r88MAC_,r88RadioState,this,station88MAC());if(e)goto fail;
  ic.ic_bss->ni_chan=ic.ic_ibss_chan;e=set88Channel((uint8_t)ieee80211_chan2ieee(&ic,ic.ic_ibss_chan),false);if(e)goto fail;
  familyRecovery_.diag.stage=rtw::StationRecovery::RX;e=busInitialize(this);if(e)goto fail;familyRecovery_.diag.stage=rtw::StationRecovery::Start;e=send88Startup();if(e)goto fail;e=coex88Start();if(e)goto fail;
- ifq_clr_oactive(&ifp.if_snd);ifp.if_flags|=IFF_RUNNING;e=ic.ic_newstate(&ic,IEEE80211_S_SCAN,-1);if(e)goto fail;radioReady_=true;if(radioAwdlPort_)(void)apply88AwdlPort(true);finishFamilyStart();return 0;
+ ifq_clr_oactive(&ifp.if_snd);ifp.if_flags|=IFF_RUNNING;e=ic.ic_newstate(&ic,IEEE80211_S_SCAN,-1);if(e)goto fail;radioReady_=true;if(radioAwdlPort_)(void)apply88AwdlPort(true);led88(true);finishFamilyStart();return 0;
 fail:failFamilyStart(e);stop88();if(!familyRecovery_.transient(e))core_.core_error=e;return e;
 }
 void RTWUSBController::remember88Authority(bool complete){
@@ -160,9 +160,32 @@ bool RTWUSBController::cleanup88Authorized(bool operating){
  r88PHY_.tables_loaded=r88MAC_.mac_ready=r88Station_.initialized=0;r88Media_=r88RateReady_=r88RSSIValid_=radioReady_=false;r88Rates_={};
  if(!core_.core_error)core_.core_error=e;return false;
 }
+/* Activity LED, RTL8821CU only (Linux rtw88 rtw8821c_led_set): REG_LED_CFG
+ * 0x4C, LED2 mode bits 18:16 = 0 (software), GPIO13/14 Wi-Fi control (bit
+ * 22) off, LED2 value bit 19: 0 = on, 1 = off. Best effort: a failed write
+ * only leaves the LED as it was. */
+void RTWUSBController::ledWrite88(bool on){
+ if(family_!=RTW_WIFI_RTL8821CU)return;uint32_t v=0;if(r88Read(this,0x4c,4,&v))return;
+ v&=~((7U<<16)|(1U<<22));if(on)v&=~(1U<<19);else v|=1U<<19;if(!r88Write(this,0x4c,4,v))ledOn_=on;
+}
+/* on: steady on, and the 100 ms timer blinks it while data frames move.
+ * off: timer stopped, LED off. */
+void RTWUSBController::led88(bool on){
+ if(family_!=RTW_WIFI_RTL8821CU)return;ledActive_=on;ledSeen_=ledTraffic_;
+ if(!on&&ledTimer_)ledTimer_->cancelTimeout();
+ ledWrite88(on);if(on&&ledTimer_)ledTimer_->setTimeoutMS(100);
+}
+void RTWUSBController::ledAction(OSObject*o,IOTimerEventSource*){
+ auto*s=static_cast<RTWUSBController*>(o);
+ if(!s->ledActive_||!s->running_||s->stopping_||!s->radioReady_||ioError(s))return;
+ const uint32_t now=s->ledTraffic_;const bool busy=now!=s->ledSeen_;s->ledSeen_=now;
+ if(busy)s->ledWrite88(!s->ledOn_);else if(!s->ledOn_)s->ledWrite88(true);
+ s->ledTimer_->setTimeoutMS(100);
+}
 void RTWUSBController::stop88(){
  familyRecovery_.inStop=true;clear88Discovery(false);
  bool hardware=owns88Authority(false,familyRecovery_.eligible);
+ if(hardware&&!ioError(this))led88(false);
  auto&ifp=core_.sc_ic.ic_if;radioReady_=false;core_.sc_tx_timer=0;ifp.if_timer=0;ifp.if_flags&=~IFF_RUNNING;ifq_clr_oactive(&ifp.if_snd);
  if(core_.sc_newstate)(void)core_.sc_newstate(&core_.sc_ic,IEEE80211_S_INIT,-1);cancelScan(this);cancelCalibration(this);
  if(r88CoexTimer_)r88CoexTimer_->cancelTimeout();
@@ -336,6 +359,7 @@ int RTWUSBController::send88Frame(mbuf_t packet,ieee80211_node*node){
  }
  bool smps=false;if(!data&&r88SMPSPending_&&length==27&&header.i_fc[0]==0xd0&&options.sequence==r88SMPSSequence_&&!memcmp(header.i_addr1,r88SMPSBSSID_,6)&&!memcmp(header.i_addr3,r88SMPSBSSID_,6)){uint8_t body[3]{};if(!mbuf_copydata(packet,24,3,body)&&body[0]==7&&body[1]==1&&body[2]==r88SMPSDesired_){smps=true;options.request_report=1;options.report_tag=r88SMPSTag_;}}
  if(data&&!multicast&&(length+4>(unsigned)ic.ic_rtsthreshold||(ic.ic_flags&IEEE80211_F_USEPROT)))options.rts=1;
+ if(data)++ledTraffic_;
  uint8_t descriptor[48]{};if(rtw88_usb_make_tx_descriptor(family_,length,&options,descriptor,sizeof(descriptor))!=RTW88_USB_TX_OK){mbuf_freem(packet);return EINVAL;}
  uint8_t pipe=0;if(rtw88_mac_queue_endpoint(&r88MAC_.fifo,options.queue,&pipe)||pipe>=endpoints_.num_bulk_out||!txPipes_[pipe]){mbuf_freem(packet);return EINVAL;}size_t total=48U+length;const uint16_t mps=txMPS_[pipe];if(mps!=64&&mps!=512&&mps!=1024){mbuf_freem(packet);return EINVAL;}if(total%mps==0)++total;if(total>TXCapacity){mbuf_freem(packet);return EINVAL;}
  auto*t=&transfers_[index];auto*bytes=static_cast<uint8_t*>(t->memory->getBytesNoCopy());bzero(bytes,total);memcpy(bytes,descriptor,48);if(mbuf_copydata(packet,0,length,bytes+48)){mbuf_freem(packet);return EINVAL;}mbuf_freem(packet);int error=submit(index,txPipes_[pipe],(uint32_t)total);if(!error){if(options.rate>=12)++txHTPackets_;if(options.ampdu){++txAMPDUPackets_;auto&ba=node->ni_tx_ba[tid];if(ba.ba_timeout_val)timeout_add_usec(&ba.ba_to,ba.ba_timeout_val);}if(data&&!multicast){r88CoexTXBytes_+=length;if(r88CoexTXPackets_!=UINT32_MAX)++r88CoexTXPackets_;}if(smps){r88SMPSWaitingUSB_=false;r88SMPSDeadline_=nowMS()+500;r88SMPSTagRetire_[r88SMPSTag_>>2]=r88SMPSDeadline_+500;coex88Schedule();}ieee80211_release_node(&ic,node);}return error;
