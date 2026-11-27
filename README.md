@@ -126,6 +126,16 @@ More AirLayer details: [airlayer/README.md](airlayer/README.md).
   to slower rates on retries.
 - Native-Wi-Fi fixes: private MAC address no longer breaks the chip identity
   check; scans while associated no longer drop the link.
+- Nearby networks stay in the Wi-Fi menu while connected: the driver keeps
+  the networks its scans heard for 10 minutes (net80211 drops them after
+  30 s), and reports each one with its SSID and channel. Hidden networks are
+  left out, as on a Mac.
+- Fast joins: a join scans only the network's known channel, so it connects
+  in 1–2 s instead of after a full 36-channel sweep (macOS gives up after
+  about 10 s).
+- The Wi-Fi menu keeps its list while a join is running.
+- RTL8821CU activity LED: on while the radio is up, blinking with data
+  traffic.
 
 ## Credits
 
